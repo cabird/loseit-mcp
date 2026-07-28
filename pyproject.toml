@@ -1,0 +1,34 @@
+[project]
+name = "loseit-mcp"
+version = "0.1.0"
+description = "MCP server for logging food to Lose It!"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lose-it",
+    "mcp>=1.2.0",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.0.1",
+]
+
+[project.scripts]
+loseit-mcp = "loseit_mcp.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loseit_mcp"]
+
+[tool.uv.sources]
+lose-it = { git = "https://github.com/phitoduck/lose-it" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100

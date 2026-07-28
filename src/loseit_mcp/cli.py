@@ -1,0 +1,319 @@
+"""Command-line interface.
+
+Two roles:
+
+- ``loseit-mcp serve`` runs the MCP server over stdio (default) or
+  streamable HTTP.
+- The remaining commands (``search``, ``diary``, ``log``, ``delete``, …) call
+  the same service layer directly, so you can exercise every operation without
+  an MCP client in the loop.
+
+Credentials resolve from CLI flags, then environment, then ``.env``, then a
+JSON config file — see :mod:`loseit_mcp.config`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from .config import ConfigError, Settings, load_settings
+from .service import LoseItService
+
+
+def _add_credential_flags(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("credentials")
+    group.add_argument("--email", help="Lose It! account email.")
+    group.add_argument("--password", help="Lose It! account password.")
+    group.add_argument("--token", help="A liauth JWT, used instead of email/password.")
+    group.add_argument("--config", type=Path, help="Path to a JSON config file.")
+    group.add_argument("--env-file", type=Path, help="Path to a .env file.")
+    group.add_argument(
+        "--hours-from-gmt",
+        type=int,
+        help="UTC offset in whole hours (auto-detected by default).",
+    )
+
+
+def _settings_from_args(args: argparse.Namespace) -> Settings:
+    return load_settings(
+        config_file=getattr(args, "config", None),
+        env_file=getattr(args, "env_file", None),
+        email=getattr(args, "email", None),
+        password=getattr(args, "password", None),
+        token=getattr(args, "token", None),
+        hours_from_gmt=getattr(args, "hours_from_gmt", None),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="loseit-mcp",
+        description="MCP server and CLI for the Lose It! food diary.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON instead of formatted text.",
+    )
+    _add_credential_flags(parser)
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    serve = sub.add_parser("serve", help="Run the MCP server.")
+    serve.add_argument(
+        "--transport",
+        choices=("stdio", "streamable-http", "sse"),
+        default="stdio",
+        help="Transport to serve on (default: stdio).",
+    )
+    serve.add_argument("--host", default="127.0.0.1", help="Bind host for HTTP transports.")
+    serve.add_argument("--port", type=int, default=8000, help="Bind port for HTTP transports.")
+    serve.add_argument("--path", default="/mcp", help="URL path for streamable HTTP.")
+
+    sub.add_parser("whoami", help="Show the authenticated account.")
+
+    search = sub.add_parser("search", help="Search the food database.")
+    search.add_argument("query", help="Food name to search for.")
+    search.add_argument("-n", "--limit", type=int, default=10, help="Max results.")
+
+    describe = sub.add_parser("describe", help="Show nutrition detail for a food.")
+    describe.add_argument("food_id", help="32-character hex food ID.")
+
+    diary = sub.add_parser("diary", help="Show the food log for a day.")
+    diary.add_argument(
+        "date",
+        nargs="?",
+        help="YYYY-MM-DD, 'today', or 'yesterday' (default: today).",
+    )
+
+    log = sub.add_parser("log", help="Log a food to a meal.")
+    log.add_argument("food_id", help="32-character hex food ID.")
+    log.add_argument(
+        "-m",
+        "--meal",
+        default="snacks",
+        choices=("breakfast", "lunch", "dinner", "snacks", "snack"),
+        help="Meal to log to (default: snacks).",
+    )
+    log.add_argument("-s", "--servings", type=float, help="Multiplier of the default serving.")
+    log.add_argument("-a", "--amount", type=float, help="Quantity, paired with --unit.")
+    log.add_argument("-u", "--unit", help="Unit for --amount, e.g. g, mL, cup, oz.")
+    log.add_argument("-d", "--date", help="Day to log to (default: today).")
+    log.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the calorie math without writing.",
+    )
+
+    custom = sub.add_parser(
+        "log-custom",
+        help="Log a food by its nutrition values, with no database lookup.",
+    )
+    custom.add_argument("name", help="Food name as it should appear in the diary.")
+    custom.add_argument("calories", type=float, help="Calories per serving.")
+    custom.add_argument(
+        "-m",
+        "--meal",
+        default="snacks",
+        choices=("breakfast", "lunch", "dinner", "snacks", "snack"),
+        help="Meal to log to (default: snacks).",
+    )
+    custom.add_argument("-b", "--brand", default="", help="Brand or restaurant.")
+    custom.add_argument("-p", "--protein", type=float, help="Protein (g).")
+    custom.add_argument("-c", "--carbs", type=float, help="Carbohydrate (g).")
+    custom.add_argument("-f", "--fat", type=float, help="Total fat (g).")
+    custom.add_argument("--sat-fat", type=float, help="Saturated fat (g).")
+    custom.add_argument("--fiber", type=float, help="Fiber (g).")
+    custom.add_argument("--sugar", type=float, help="Sugar (g).")
+    custom.add_argument("--sodium", type=float, help="Sodium (mg).")
+    custom.add_argument("--cholesterol", type=float, help="Cholesterol (mg).")
+    custom.add_argument("-s", "--servings", type=float, default=1.0, help="Servings.")
+    custom.add_argument("-d", "--date", help="Day to log to (default: today).")
+    custom.add_argument("--dry-run", action="store_true", help="Preview without writing.")
+
+    delete = sub.add_parser("delete", help="Delete a diary entry.")
+    delete.add_argument("entry_id", help="entry_id from the diary command.")
+    delete.add_argument("-d", "--date", help="Day the entry is on (default: today).")
+
+    return parser
+
+
+# ── Output formatting ───────────────────────────────────────────────────
+
+
+def _print_json(data: Any) -> None:
+    print(json.dumps(data, indent=2, default=str))
+
+
+def _print_search(results: list[dict[str, Any]]) -> None:
+    if not results:
+        print("No foods found.")
+        return
+    for r in results:
+        brand = f"  [{r['brand']}]" if r.get("brand") else ""
+        print(f"{r.get('food_id')}  {r.get('name')}{brand}")
+
+
+def _print_diary(day: dict[str, Any]) -> None:
+    print(f"{day['date']} — {day['entry_count']} entries, {day['total_calories']:g} cal")
+    if not day["entries"]:
+        return
+    by_meal: dict[str, list[dict[str, Any]]] = {}
+    for entry in day["entries"]:
+        by_meal.setdefault(entry["meal"], []).append(entry)
+
+    for meal in ("breakfast", "lunch", "dinner", "snacks"):
+        items = by_meal.get(meal)
+        if not items:
+            continue
+        subtotal = sum(i.get("calories") or 0 for i in items)
+        print(f"\n{meal.upper()} ({subtotal:.0f} cal)")
+        for i in items:
+            brand = f" [{i['food_brand']}]" if i.get("food_brand") else ""
+            amount = i.get("amount")
+            portion = f"{amount:g} {i.get('unit') or ''}".strip()
+            print(
+                f"  {i.get('calories') or 0:>7.1f} cal  {portion:<16} "
+                f"{i.get('food_name')}{brand}"
+            )
+            print(f"  {'':>7}       {i.get('entry_id')}")
+
+
+def _print_logged(result: dict[str, Any]) -> None:
+    prefix = "DRY RUN — would log" if result.get("dry_run") else "Logged"
+    food = result.get("food") or {}
+    print(
+        f"{prefix}: {food.get('name')} — {result.get('portion_size')} "
+        f"{result.get('measure_unit')} to {result.get('meal')} on {result.get('date')} "
+        f"({result.get('calories'):.0f} cal)"
+    )
+
+
+# ── Dispatch ────────────────────────────────────────────────────────────
+
+
+def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
+    from .server import build_server
+
+    settings.require_credentials()
+    mcp = build_server(settings)
+
+    if args.transport == "stdio":
+        mcp.run("stdio")
+    elif args.transport == "streamable-http":
+        print(
+            f"Serving MCP over streamable HTTP at http://{args.host}:{args.port}{args.path}",
+            file=sys.stderr,
+        )
+        mcp.run(
+            "streamable-http",
+            host=args.host,
+            port=args.port,
+            streamable_http_path=args.path,
+        )
+    else:
+        print(f"Serving MCP over SSE at http://{args.host}:{args.port}", file=sys.stderr)
+        mcp.run("sse", host=args.host, port=args.port)
+    return 0
+
+
+def _run_command(args: argparse.Namespace, settings: Settings) -> int:
+    as_json = args.json
+
+    with LoseItService(settings) as svc:
+        if args.command == "whoami":
+            _print_json(svc.whoami())
+
+        elif args.command == "search":
+            results = svc.search_food(args.query, limit=args.limit)
+            _print_json(results) if as_json else _print_search(results)
+
+        elif args.command == "describe":
+            _print_json(svc.describe_food(args.food_id))
+
+        elif args.command == "diary":
+            day = svc.get_diary(args.date)
+            _print_json(day) if as_json else _print_diary(day)
+
+        elif args.command == "log":
+            result = svc.log_food(
+                args.food_id,
+                meal=args.meal,
+                servings=args.servings,
+                serving_amount=args.amount,
+                serving_unit=args.unit,
+                when=args.date,
+                dry_run=args.dry_run,
+            )
+            _print_json(result) if as_json else _print_logged(result)
+
+        elif args.command == "log-custom":
+            result = svc.log_custom_food(
+                name=args.name,
+                calories=args.calories,
+                meal=args.meal,
+                brand=args.brand,
+                protein_g=args.protein,
+                carb_g=args.carbs,
+                fat_g=args.fat,
+                saturated_fat_g=args.sat_fat,
+                fiber_g=args.fiber,
+                sugar_g=args.sugar,
+                sodium_mg=args.sodium,
+                cholesterol_mg=args.cholesterol,
+                servings=args.servings,
+                when=args.date,
+                dry_run=args.dry_run,
+            )
+            if as_json:
+                _print_json(result)
+            else:
+                prefix = "DRY RUN — would log" if result["dry_run"] else "Logged"
+                food = result["food"]
+                brand = f" [{food['brand']}]" if food["brand"] else ""
+                print(
+                    f"{prefix}: {food['name']}{brand} to {result['meal']} "
+                    f"on {result['date']} ({result['calories']:g} cal)"
+                )
+
+        elif args.command == "delete":
+            result = svc.delete_entry(args.entry_id, when=args.date)
+            if as_json:
+                _print_json(result)
+            else:
+                entry = result.get("entry") or {}
+                print(f"Deleted: {entry.get('food_name')} ({entry.get('meal')})")
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to a legacy code page, which mangles em-dashes
+    # and any non-ASCII food name (e.g. "Häagen-Dazs").
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+    args = build_parser().parse_args(argv)
+    try:
+        settings = _settings_from_args(args)
+        if args.command == "serve":
+            return _run_serve(args, settings)
+        return _run_command(args, settings)
+    except (ConfigError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

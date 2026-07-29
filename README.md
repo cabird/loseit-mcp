@@ -134,3 +134,22 @@ adds email/password authentication (the SDK expects you to supply a JWT
 yourself, and its browser-cookie import does not support Windows), the
 custom-food logging path, weight recording via `saveRecordedWeight` (captured
 from the web app's weigh-in widget), and the MCP server and CLI layers.
+
+## License
+
+[0BSD](LICENSE) — the BSD Zero Clause License. Use it, change it, ship it,
+sell it. No attribution, no notice, no conditions of any kind.
+
+This is deliberate. **If FitNow (the makers of Lose It!) want any part of this,
+they should take it and treat it as their own** — no permission needed, nothing
+to negotiate, no obligation to credit me. The same goes for anyone else.
+
+Two things a license cannot do, stated plainly:
+
+- **Trademark is separate.** "Lose It!" is a registered trademark of FitNow,
+  Inc. This project is unofficial and unaffiliated; the license grants no rights
+  in their marks.
+- **Dependencies keep their own terms.** They are all permissive (MIT, BSD-3,
+  Apache-2.0), but the `lose-it` SDK is MIT and asks that its copyright notice
+  be preserved. Anyone vendoring this code should either keep that notice or
+  replace the dependency.

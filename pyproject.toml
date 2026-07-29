@@ -3,7 +3,14 @@ name = "loseit-mcp"
 version = "0.3.7"
 description = "MCP server for logging food to Lose It!"
 readme = "README.md"
+license = "0BSD"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+classifiers = [
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
 dependencies = [
     "lose-it",
     "mcp>=1.2.0",

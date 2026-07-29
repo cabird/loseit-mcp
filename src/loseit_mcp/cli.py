@@ -243,9 +243,29 @@ def _build_registry(settings: Settings) -> EnrollmentRegistry | None:
             "and send it as the X-Enroll-Secret header."
         )
     path = Path(os.environ.get("LOSEIT_ENROLLMENT_PATH") or CONFIG_DIR / "enrollments.json")
+    _check_writable(path)
     registry = EnrollmentRegistry(FileEnrollmentStore(path), secret.encode("utf-8"))
     registry.purge_expired()
     return registry
+
+
+def _check_writable(path: Path) -> None:
+    """Fail at startup if the enrollment store can't be written.
+
+    Otherwise the problem only surfaces as a 500 the first time someone tries
+    to enroll — after the container has already reported itself healthy.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        probe = path.parent / f".write-probe-{os.getpid()}"
+        probe.touch()
+        probe.unlink()
+    except OSError as exc:
+        raise ConfigError(
+            f"Enrollment store directory {path.parent} is not writable: {exc}. "
+            "Point LOSEIT_ENROLLMENT_PATH at a writable, persistent location "
+            "(a mounted volume, or /home on Azure App Service)."
+        ) from exc
 
 
 def _run_serve(args: argparse.Namespace, settings: Settings) -> int:

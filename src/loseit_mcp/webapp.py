@@ -220,6 +220,13 @@ def add_enrollment_routes(
             )
         except EnrollmentError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError as exc:
+            # Storage failure is an operator problem, not a client one; say so
+            # without echoing filesystem detail back to the caller.
+            logging.getLogger(__name__).error("Enrollment store write failed: %s", exc)
+            return JSONResponse(
+                {"error": "Enrollment storage is unavailable."}, status_code=503
+            )
 
         base = _public_base_url(request)
         return JSONResponse(

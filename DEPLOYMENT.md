@@ -150,7 +150,12 @@ grow it without limit, and evicts expired entries first.
 
 ```console
 docker build -t loseit-mcp:test .
-docker run -d --name loseit-test -p 8900:8000 loseit-mcp:test
+docker run -d --name loseit-test -p 8900:8000 \
+  -v loseit-data:/data \
+  -e LOSEIT_CACHE_SECRET=<secret> \
+  -e LOSEIT_ENROLLMENT=1 \
+  -e LOSEIT_ENROLL_SECRET=<secret> \
+  loseit-mcp:test
 curl http://127.0.0.1:8900/healthz     # {"status":"ok"}
 ```
 
@@ -165,9 +170,17 @@ The image:
 - is a two-stage build; the runtime carries no build tooling or package cache
 - runs as an unprivileged `app` user
 - contains **no credentials** — it starts fine with none configured
+- writes enrollments to `/data`, declared as a volume so they outlive the
+  container. Verified: an issued URL still works after `docker restart`.
 - exposes `/healthz` for platform probes, which reports process liveness only
   (not Lose It reachability, so an upstream outage doesn't get healthy
   instances killed)
+- fails fast at startup if the enrollment path is unwritable, rather than
+  reporting healthy and then 500-ing on the first enrollment
+
+Dependency resolution is layered ahead of the source copy, so editing code
+skips the expensive step (cloning the git-sourced SDK and building wheels).
+Measured: **3.3s** for a source-only rebuild versus 22.8s from cold.
 
 ## Azure App Service
 
@@ -186,19 +199,30 @@ az webapp config appsettings set \
   --resource-group <rg> --name <app-name> \
   --settings LOSEIT_MULTI_TENANT=1 \
              WEBSITES_PORT=8000 \
-             LOSEIT_CACHE_SECRET=<generated-secret>
+             LOSEIT_CACHE_SECRET=<generated-secret> \
+             LOSEIT_ENROLLMENT=1 \
+             LOSEIT_ENROLL_SECRET=<generated-secret> \
+             LOSEIT_ENROLLMENT_PATH=/home/loseit/enrollments.json \
+             WEBSITES_ENABLE_APP_SERVICE_STORAGE=true \
+             LOSEIT_HOURS_FROM_GMT=-7
 ```
 
 Notes specific to App Service:
 
 - `WEBSITES_PORT` must match the container's port; the app also honours `PORT`.
-- Store `LOSEIT_CACHE_SECRET` in Key Vault and reference it, rather than
-  inlining it in app settings.
+- `WEBSITES_ENABLE_APP_SERVICE_STORAGE=true` makes `/home` a persistent share.
+  Point `LOSEIT_ENROLLMENT_PATH` there — the container filesystem is ephemeral,
+  and every restart would otherwise orphan all issued URLs.
+- Store `LOSEIT_CACHE_SECRET` and `LOSEIT_ENROLL_SECRET` in Key Vault and
+  reference them, rather than inlining them in app settings.
 - Enable **HTTPS Only** and set the minimum TLS version to 1.2. Credentials
-  travel in headers, so plaintext HTTP is not an acceptable fallback.
+  travel in headers or the URL path, so plaintext HTTP is not an acceptable
+  fallback.
 - Keep the app on a single instance unless a shared cache backend is added;
   otherwise each instance re-authenticates independently.
-- Set **Always On** to avoid cold starts wiping the token cache.
+- Set **Always On** to avoid cold starts wiping the session cache.
+- Scrub or disable request-path logging: enrollment tokens ride in the path.
+  The app redacts its own logs, but Azure's platform logging is separate.
 
 ## Client configuration
 

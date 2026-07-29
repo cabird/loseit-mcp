@@ -7,6 +7,10 @@ token
 secrets.json
 *.secret
 
+# Deployment notes containing real Azure resource names
+DEPLOYMENT-PRIVATE.md
+*-PRIVATE.md
+
 # Python
 __pycache__/
 *.py[cod]
@@ -23,6 +27,4 @@ htmlcov/
 # Scratch/debug files
 scratch_*.py
 tmp-*.json
-
-# Local temp files
 *.tmp

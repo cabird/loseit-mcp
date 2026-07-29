@@ -196,48 +196,170 @@ Measured: **3.3s** for a source-only rebuild versus 22.8s from cold.
 
 ## Azure App Service
 
-Cheapest tier with Always On is **Linux B1** (~$13/month).
+Cheapest tier with Always On is **Linux B1** (~$13/month). A container registry
+(~$5) and Key Vault (~$0.03) bring the total to roughly **$18/month**.
+
+The walkthrough below uses placeholder names — substitute your own. Registry
+names must be globally unique and alphanumeric only; Key Vault names must be
+globally unique.
+
+### 1. Resource group
 
 ```console
-az acr build --registry <registry> --image loseit-mcp:v1 .
+az group create --name loseit-mcp-rg --location westus
+```
+
+> **Check your B1 quota first.** Some subscriptions have zero App Service quota
+> in a given region — the plan creation below fails with a quota message rather
+> than anything obviously region-related. If that happens, try another region;
+> nothing here is region-specific.
+
+### 2. Container registry, and push the image
+
+```console
+az acr create --resource-group loseit-mcp-rg --name <registry> \
+  --sku Basic --admin-enabled true
+
+az acr login --name <registry>
+docker build -t <registry>.azurecr.io/loseit-mcp:v1 .
+docker push <registry>.azurecr.io/loseit-mcp:v1
+```
+
+> **Build locally, not with `az acr build`.** ACR's classic build agent has no
+> BuildKit, so the `--mount=type=cache` directives in the Dockerfile fail there.
+
+### 3. App Service plan and web app
+
+```console
+az appservice plan create --name loseit-mcp-plan \
+  --resource-group loseit-mcp-rg --location westus --is-linux --sku B1
 
 az webapp create \
-  --resource-group <rg> \
-  --plan <plan> \
-  --name loseit-mcp \
-  --deployment-container-image-name <registry>.azurecr.io/loseit-mcp:v1
-
-az webapp config appsettings set \
-  --resource-group <rg> --name loseit-mcp \
-  --settings LOSEIT_MULTI_TENANT=1 \
-             WEBSITES_PORT=8000 \
-             LOSEIT_ENROLLMENT=1 \
-             LOSEIT_URL_SECRET=<generated-secret> \
-             LOSEIT_ENROLL_SECRET=<generated-secret> \
-             LOSEIT_HOURS_FROM_GMT=-7
+  --resource-group loseit-mcp-rg \
+  --plan loseit-mcp-plan \
+  --name <app-name> \
+  --container-image-name <registry>.azurecr.io/loseit-mcp:v1 \
+  --container-registry-url https://<registry>.azurecr.io \
+  --assign-identity '[system]'
 ```
 
-Generate the secrets with:
+> **Verify the image name afterwards.** Some CLI versions prepend the registry
+> to an already-qualified image, producing
+> `<registry>.azurecr.io/<registry>.azurecr.io/loseit-mcp:v1` and a 503 that
+> looks like an app failure. Check and correct with:
+>
+> ```console
+> az webapp config container show --resource-group loseit-mcp-rg --name <app-name>
+> az webapp config container set --resource-group loseit-mcp-rg --name <app-name> \
+>   --container-image-name <registry>.azurecr.io/loseit-mcp:v1 \
+>   --container-registry-url https://<registry>.azurecr.io
+> ```
+
+Let the app pull from the registry with its identity, rather than storing admin
+credentials:
 
 ```console
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+az role assignment create \
+  --assignee $(az webapp identity show --name <app-name> \
+      --resource-group loseit-mcp-rg --query principalId -o tsv) \
+  --scope $(az acr show --name <registry> --query id -o tsv) \
+  --role AcrPull
 ```
 
-Notes specific to App Service:
+### 4. Secrets in Key Vault
 
-- `WEBSITES_PORT` must match the container's port; the app also honours `PORT`.
-- **No persistent storage is needed.** Nothing is written to disk.
-- Store both secrets in Key Vault and reference them rather than inlining them
-  in app settings. `LOSEIT_URL_SECRET` is permanent: changing it invalidates
-  every issued URL.
-- Enable **HTTPS Only** and set the minimum TLS version to 1.2. Credentials
-  travel in headers or the URL path, so plaintext HTTP is not an acceptable
-  fallback.
-- Set **Always On** so the session cache isn't wiped by idle shutdowns.
+```console
+loseit-mcp gen-secret        # run twice: one URL secret, one enroll secret
+
+az keyvault create --name <vault> --resource-group loseit-mcp-rg \
+  --location westus --enable-rbac-authorization true
+
+az role assignment create --assignee <your-user-object-id> \
+  --scope $(az keyvault show --name <vault> --query id -o tsv) \
+  --role "Key Vault Secrets Officer"
+
+az keyvault secret set --vault-name <vault> --name loseit-url-secret    --value <secret-1>
+az keyvault secret set --vault-name <vault> --name loseit-enroll-secret --value <secret-2>
+
+az role assignment create \
+  --assignee $(az webapp identity show --name <app-name> \
+      --resource-group loseit-mcp-rg --query principalId -o tsv) \
+  --scope $(az keyvault show --name <vault> --query id -o tsv) \
+  --role "Key Vault Secrets User"
+```
+
+### 5. App settings
+
+```console
+az webapp config appsettings set \
+  --resource-group loseit-mcp-rg --name <app-name> \
+  --settings LOSEIT_MULTI_TENANT=1 \
+             LOSEIT_ENROLLMENT=1 \
+             WEBSITES_PORT=8000 \
+             LOSEIT_HOURS_FROM_GMT=-7 \
+             LOSEIT_ALLOWED_HOSTS=<app-name>.azurewebsites.net \
+             "LOSEIT_URL_SECRET=@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/loseit-url-secret/)" \
+             "LOSEIT_ENROLL_SECRET=@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/loseit-enroll-secret/)"
+```
+
+> **`LOSEIT_ALLOWED_HOSTS` is not optional.** The MCP transport validates the
+> `Host` header against an allowlist that defaults to localhost, so without it
+> every MCP request returns `421 Invalid Host header`. The app reads
+> `WEBSITE_HOSTNAME` automatically, which covers App Service — set this
+> explicitly if you use a custom domain, or to be certain.
+>
+> This failure is easy to misdiagnose: `/healthz` and `/enroll` keep working
+> because they are plain Starlette routes. Only the MCP endpoint fails.
+
+### 6. Harden and start
+
+```console
+az webapp config set --resource-group loseit-mcp-rg --name <app-name> \
+  --always-on true --min-tls-version 1.2 --http20-enabled true
+az webapp update --resource-group loseit-mcp-rg --name <app-name> --https-only true
+az webapp restart --resource-group loseit-mcp-rg --name <app-name>
+```
+
+### 7. Verify
+
+```console
+curl https://<app-name>.azurewebsites.net/healthz          # {"status":"ok"}
+curl -X POST https://<app-name>.azurewebsites.net/enroll   # 403 without the secret
+```
+
+Then get a URL and use it:
+
+```console
+loseit-mcp enroll https://<app-name>.azurewebsites.net --tz -7
+```
+
+The first request after a restart takes a few seconds (container start plus a
+Lose It login); subsequent ones are fast.
+
+### Redeploying
+
+```console
+docker build -t <registry>.azurecr.io/loseit-mcp:v2 .
+docker push <registry>.azurecr.io/loseit-mcp:v2
+az webapp config container set --resource-group loseit-mcp-rg --name <app-name> \
+  --container-image-name <registry>.azurecr.io/loseit-mcp:v2 \
+  --container-registry-url https://<registry>.azurecr.io
+az webapp restart --resource-group loseit-mcp-rg --name <app-name>
+```
+
+Rolling the image tag rather than reusing `:latest` makes it obvious which
+build is live and lets you point back at the previous tag to roll back.
+
+### Other notes
+
+- **No persistent storage is required.** Nothing is written to disk, so the
+  container filesystem can stay read-only.
 - Keep the *unique default hostname* option enabled — it makes the endpoint
   harder to stumble onto. It is not a security control; the credential is.
 - Scrub or disable request-path logging: credential URLs ride in the path. The
   app redacts its own logs, but Azure's platform logging is separate.
+- Teardown is `az group delete --name loseit-mcp-rg --yes`. Key Vault
+  soft-delete keeps the vault name reserved for 90 days afterwards.
 
 ## Client configuration
 
@@ -248,7 +370,7 @@ With request headers:
   "mcpServers": {
     "loseit": {
       "type": "http",
-      "url": "https://loseit-mcp.azurewebsites.net/mcp",
+      "url": "https://<app-name>.azurewebsites.net/mcp",
       "headers": {
         "Authorization": "Basic <base64 of email:password>"
       }
@@ -264,7 +386,7 @@ With a credential URL (no headers needed):
   "mcpServers": {
     "loseit": {
       "type": "http",
-      "url": "https://loseit-mcp.azurewebsites.net/u/<sealed>/mcp"
+      "url": "https://<app-name>.azurewebsites.net/u/<sealed>/mcp"
     }
   }
 }
@@ -279,6 +401,7 @@ With a credential URL (no headers needed):
 | `LOSEIT_URL_SECRET` | — | Seals/opens credential URLs. **Required** for enrollment |
 | `LOSEIT_ENROLL_SECRET` | — | Required to call `/enroll`. **Required** for enrollment |
 | `LOSEIT_CACHE_SECRET` | random per process | Session-cache key material |
+| `LOSEIT_ALLOWED_HOSTS` | `WEBSITE_HOSTNAME`, else localhost | Comma-separated hostnames the MCP endpoint will answer on |
 | `PORT` | `8000` | Listen port |
 | `LOSEIT_HOURS_FROM_GMT` | auto-detected | Default account UTC offset |
 | `LOSEIT_STRONG_NAME` | current build | GWT permutation, if Lose It redeploys |

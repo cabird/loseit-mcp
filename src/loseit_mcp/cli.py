@@ -169,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enroll.add_argument(
         "server",
-        help="Base URL of the hosted server, e.g. https://loseit-mcp.azurewebsites.net",
+        help="Base URL of the hosted server, e.g. https://my-loseit-mcp.azurewebsites.net",
     )
     enroll.add_argument("--email", help="Lose It! account email (prompted if omitted).")
     enroll.add_argument(

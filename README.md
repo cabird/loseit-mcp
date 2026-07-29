@@ -73,6 +73,8 @@ Register the stdio server with an MCP client:
 }
 ```
 
+To host one server for multiple accounts, see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## CLI
 
 The same operations are available directly, which is the easiest way to test:

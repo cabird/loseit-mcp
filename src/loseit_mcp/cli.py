@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1", help="Bind host for HTTP transports.")
     serve.add_argument("--port", type=int, default=8000, help="Bind port for HTTP transports.")
     serve.add_argument("--path", default="/mcp", help="URL path for streamable HTTP.")
+    serve.add_argument(
+        "--multi-tenant",
+        action="store_true",
+        default=os.environ.get("LOSEIT_MULTI_TENANT", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Take Lose It! credentials from each request's headers instead of the "
+            "environment. Required for hosting one server for multiple accounts."
+        ),
+    )
 
     sub.add_parser("whoami", help="Show the authenticated account.")
 
@@ -213,16 +223,34 @@ def _print_logged(result: dict[str, Any]) -> None:
 def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
     from .server import build_server
 
-    settings.require_credentials()
-    mcp = build_server(settings)
+    multi_tenant = getattr(args, "multi_tenant", False)
+
+    # In multi-tenant mode credentials come from each request, so the process
+    # itself needs none — and shouldn't be started with any.
+    if not multi_tenant:
+        settings.require_credentials()
+
+    mcp = build_server(settings, multi_tenant=multi_tenant)
 
     if args.transport == "stdio":
+        if multi_tenant:
+            print(
+                "error: --multi-tenant needs per-request headers, which stdio "
+                "has none of. Use --transport streamable-http.",
+                file=sys.stderr,
+            )
+            return 2
         mcp.run("stdio")
-    elif args.transport == "streamable-http":
+        return 0
+
+    mode = "multi-tenant" if multi_tenant else "single-account"
+    if args.transport == "streamable-http":
         print(
-            f"Serving MCP over streamable HTTP at http://{args.host}:{args.port}{args.path}",
+            f"Serving MCP ({mode}) over streamable HTTP at "
+            f"http://{args.host}:{args.port}{args.path}",
             file=sys.stderr,
         )
+        _add_health_route(mcp)
         mcp.run(
             "streamable-http",
             host=args.host,
@@ -230,9 +258,24 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
             streamable_http_path=args.path,
         )
     else:
-        print(f"Serving MCP over SSE at http://{args.host}:{args.port}", file=sys.stderr)
+        print(f"Serving MCP ({mode}) over SSE at http://{args.host}:{args.port}", file=sys.stderr)
+        _add_health_route(mcp)
         mcp.run("sse", host=args.host, port=args.port)
     return 0
+
+
+def _add_health_route(mcp: Any) -> None:
+    """Expose ``/healthz`` for container and platform health probes.
+
+    Deliberately unauthenticated and dependency-free: it reports that the
+    process is serving, not that Lose It! is reachable, so a Lose It outage
+    doesn't cause the platform to kill otherwise-healthy instances.
+    """
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/healthz", methods=["GET"])
+    async def healthz(_request: Any) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
 
 
 def _run_command(args: argparse.Namespace, settings: Settings) -> int:

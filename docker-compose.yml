@@ -1,0 +1,23 @@
+services:
+  loseit-mcp:
+    build: .
+    image: loseit-mcp:local
+    ports:
+      - "8000:8000"
+    environment:
+      # Credentials arrive per request; the container holds none.
+      LOSEIT_MULTI_TENANT: "1"
+      PORT: "8000"
+      # Pin the cache key secret so cached sessions survive a restart. Generate
+      # with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      LOSEIT_CACHE_SECRET: "${LOSEIT_CACHE_SECRET:-dev-only-not-for-production}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true

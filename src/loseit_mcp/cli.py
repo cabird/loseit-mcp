@@ -285,6 +285,42 @@ def _build_sealer(settings: Settings) -> UrlSealer | None:
     return UrlSealer(secret.encode("utf-8"))
 
 
+def _transport_security() -> Any:
+    """Configure the transport's DNS-rebinding protection.
+
+    The MCP transport validates the Host header against an allowlist that
+    defaults to localhost, so a hosted deployment must declare its own hostname
+    or every request is rejected with "Invalid Host header".
+
+    ``LOSEIT_ALLOWED_HOSTS`` takes a comma-separated list. On Azure App Service
+    the site's hostnames are discoverable from the environment, so the common
+    case needs no configuration at all.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    hosts: list[str] = []
+    configured = os.environ.get("LOSEIT_ALLOWED_HOSTS", "")
+    hosts.extend(h.strip() for h in configured.split(",") if h.strip())
+
+    # WEBSITE_HOSTNAME is set by App Service; include it and any custom
+    # hostnames bound to the site.
+    for name in ("WEBSITE_HOSTNAME", "HTTP_HOST"):
+        value = os.environ.get(name)
+        if value:
+            hosts.append(value)
+
+    if not hosts:
+        return None  # keep the library's localhost-only default
+
+    # Origins must carry a scheme; hosts must not.
+    origins = [f"https://{h}" for h in hosts] + [f"http://{h}" for h in hosts]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins,
+    )
+
+
 def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
     import uvicorn
 
@@ -329,7 +365,10 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
         mcp.run("sse", host=args.host, port=args.port)
         return 0
 
-    app = mcp.streamable_http_app(streamable_http_path=args.path)
+    app = mcp.streamable_http_app(
+        streamable_http_path=args.path,
+        transport_security=_transport_security(),
+    )
     if sealer is not None:
         app = PathTokenMiddleware(app, mount_path=args.path)
 

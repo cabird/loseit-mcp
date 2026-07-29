@@ -16,10 +16,14 @@ start, and are refreshed automatically once the JWT's ``exp`` claim passes.
 from __future__ import annotations
 
 import base64
+import getpass
 import json
 import os
 import stat
+import subprocess
+import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -81,16 +85,51 @@ def is_expired(token: str, *, leeway_seconds: int = 300) -> bool:
 
 
 def _write_private(path: Path, text: str) -> None:
-    """Write a file only the current user can read."""
+    """Write a file that only the current user can read.
+
+    The file is created with mode 0600 *before* any content is written, so the
+    token is never briefly visible under a permissive umask. Each write uses a
+    unique temporary name so concurrent writers can't clobber each other's
+    partial files.
+
+    On Windows POSIX modes are not enforced, so we additionally reset the DACL
+    to the current user only.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(tmp, flags, stat.S_IRUSR | stat.S_IWUSR)
     try:
-        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        # Best effort — Windows ignores POSIX modes.
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    if sys.platform == "win32":
+        _restrict_windows_acl(tmp)
+
+    os.replace(tmp, path)
+
+
+def _restrict_windows_acl(path: Path) -> None:
+    """Reset a file's ACL to the current user only (best effort).
+
+    ``os.chmod`` does not change Windows ACLs, so a token file could otherwise
+    inherit directory permissions that are wider than intended.
+    """
+    try:
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{getpass.getuser()}:F"],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Non-fatal: the file still exists and the caller may not be able to do
+        # anything about a locked-down environment.
         pass
-    tmp.replace(path)
 
 
 def load_cached_session(path: Path) -> Session | None:
@@ -193,13 +232,19 @@ def resolve_session(settings: Settings, *, force_login: bool = False) -> Session
 
     Resolution order:
 
-    1. An explicitly supplied ``token`` (``--token`` / ``LOSEIT_TOKEN``).
-    2. A cached session on disk that hasn't expired.
+    1. An explicitly supplied ``token`` (``--token`` / ``LOSEIT_TOKEN``), unless
+       it has expired and we hold credentials that can mint a fresh one.
+    2. A cached session on disk that hasn't expired **and belongs to the
+       configured account**.
     3. A fresh login with ``email`` + ``password``.
     """
     settings.require_credentials()
+    can_login = bool(settings.email and settings.password)
 
-    if settings.token and not force_login:
+    # Only fall through to a login when we can actually perform one; otherwise
+    # an expired token is still the caller's best option and the resulting API
+    # error is clearer than a config error raised here.
+    if settings.token and not force_login and not (is_expired(settings.token) and can_login):
         claims = decode_jwt_payload(settings.token) or {}
         return Session(
             token=settings.token,
@@ -210,15 +255,15 @@ def resolve_session(settings: Settings, *, force_login: bool = False) -> Session
 
     if not force_login:
         cached = load_cached_session(settings.session_file)
-        if cached:
+        if cached and _matches_configured_account(cached, settings):
             return _apply_overrides(cached, settings)
 
-    if not (settings.email and settings.password):
+    if not can_login:
         raise ConfigError(
             "A fresh login is required but no email/password is configured."
         )
 
-    session = login(settings.email, settings.password)
+    session = login(settings.email, settings.password)  # type: ignore[arg-type]
     session = _apply_overrides(session, settings)
     save_session(session, settings.session_file)
     return session
@@ -232,3 +277,17 @@ def _apply_overrides(session: Session, settings: Settings) -> Session:
         user_name=settings.user_name or session.user_name,
         email=session.email or settings.email,
     )
+
+
+def _matches_configured_account(session: Session, settings: Settings) -> bool:
+    """True if a cached session belongs to the account we're configured for.
+
+    Without this check, changing ``LOSEIT_EMAIL`` would silently keep using the
+    previous account's cached token — so reads and, worse, writes would land on
+    the wrong diary.
+    """
+    if not settings.email:
+        return True
+    if not session.email:
+        return False
+    return session.email.strip().lower() == settings.email.strip().lower()

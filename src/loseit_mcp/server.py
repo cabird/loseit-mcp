@@ -7,6 +7,8 @@ streamable-HTTP entry points in :mod:`loseit_mcp.cli`.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
@@ -38,10 +40,21 @@ Deleting: call `get_diary` first to get an `entry_id`, then `delete_entry`.
 def build_server(settings: Settings) -> MCPServer:
     """Construct the MCP server bound to a configured Lose It! account."""
     service = LoseItService(settings)
+
+    @asynccontextmanager
+    async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            # Release the HTTP connection pool on shutdown rather than leaking
+            # it for the life of the process.
+            service.close()
+
     mcp = MCPServer(
         name="loseit",
         version="0.1.0",
         instructions=INSTRUCTIONS,
+        lifespan=lifespan,
     )
 
     @mcp.tool(
@@ -212,6 +225,25 @@ def build_server(settings: Settings) -> MCPServer:
         dry_run: Annotated[bool, Field(description="Preview without writing.")] = False,
     ) -> dict[str, Any]:
         return service.log_weight(weight, when=date, dry_run=dry_run)
+
+    @mcp.tool(
+        description=(
+            "Read recorded weigh-ins over a date range, with min/max/change "
+            "summary. Defaults to the last 30 days."
+        )
+    )
+    def get_weight_history(
+        start: Annotated[
+            str | None, Field(description="First day: 'YYYY-MM-DD'. Defaults to `days` back.")
+        ] = None,
+        end: Annotated[
+            str | None, Field(description="Last day: 'YYYY-MM-DD'. Defaults to today.")
+        ] = None,
+        days: Annotated[
+            int, Field(description="Window size when `start` is omitted.", ge=1, le=365)
+        ] = 30,
+    ) -> dict[str, Any]:
+        return service.get_weight_history(start=start, end=end, days=days)
 
     @mcp.tool(description="Show which Lose It! account this server is authenticated as.")
     def whoami() -> dict[str, Any]:

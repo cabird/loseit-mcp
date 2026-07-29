@@ -9,23 +9,33 @@ and CLI layers can hand results straight to a client.
 from __future__ import annotations
 
 import re
+import threading
 import uuid
-from datetime import date, datetime
-from typing import Any
+from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Self, TypeVar
 
 from lose_it import LoseIt, MealType, UnsavedFoodLogEntry
 from lose_it.core import entries as _entries
 from lose_it.core._config import Config
 from lose_it.core._dates import day_number_for
-from lose_it.core._http import LoseItAuthError
+from lose_it.core._http import LoseItAuthError, LoseItError
 from lose_it.core._ids import pk_to_hex
 from lose_it.core.daily import get_daydate_key
 
 from .auth import Session, resolve_session
 from .config import Settings
+from .weight import get_weight_history as _get_weight_history
 from .weight import save_weight
 
+_T = TypeVar("_T")
+
 # FoodNutrient enum ordinals the server accepts inside a logged entry.
+#
+# Verified empirically via describe_food (olive oil, butter, peanuts): ordinal
+# 3 is total fat, 4 is saturated fat, 2 is serving weight in grams. Note the
+# SDK's own `_config.NUTRIENT_NAMES` table disagrees (it labels 2 as fat and 3
+# as saturated fat) and is stale.
 _NUTRIENT_ORDINALS = {
     "calories": 0,
     "total_fat_g": 3,
@@ -38,10 +48,42 @@ _NUTRIENT_ORDINALS = {
     "protein_g": 13,
 }
 
+# The SDK's payload builder drops any ordinal outside its own accept-list, so
+# some nutrients we accept never reach the wire. We intersect against it when
+# reporting results rather than claiming to have logged a value that was
+# filtered out in transit. `saturated_fat_g` (ordinal 4) is the one casualty
+# today — the server does store it (it comes back on reads), but the SDK will
+# not send it.
+_SENDABLE_ORDINALS = frozenset(_entries._CORE_NUTRIENT_ORDINALS)
+_DROPPED_NUTRIENTS = tuple(
+    sorted(name for name, ord_ in _NUTRIENT_ORDINALS.items() if ord_ not in _SENDABLE_ORDINALS)
+)
+
 
 def _random_pk() -> list[int]:
     """A random 16-byte primary key in the signed form the wire format uses."""
     return [b - 256 if b >= 128 else b for b in uuid.uuid4().bytes]
+
+
+# Lose It reports an expired/invalid token as an HTTP 200 carrying a GWT
+# exception envelope, which the SDK surfaces as a plain LoseItError. Only the
+# rarer transport-level 401/403 becomes LoseItAuthError, so matching on the
+# exception type alone would miss the common case.
+_AUTH_FAILURE_MARKERS = (
+    "UserAuthenticationFailedException",
+    "NotAuthenticatedException",
+    "InvalidSessionException",
+)
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    """True if ``exc`` means the credentials/token are no longer good."""
+    if isinstance(exc, LoseItAuthError):
+        return True
+    if isinstance(exc, LoseItError):
+        message = str(exc)
+        return any(marker in message for marker in _AUTH_FAILURE_MARKERS)
+    return False
 
 
 # The GWT string table ships non-ASCII and quote characters as literal
@@ -54,44 +96,68 @@ def _unescape(text: str) -> str:
     return _GWT_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
 
 
-def _parse_date(value: str | date | None) -> date | None:
-    """Accept ``None``, a ``date``, ``'today'``/``'yesterday'``, or ISO ``YYYY-MM-DD``."""
+def _parse_date(value: str | date | None, hours_from_gmt: int | None = None) -> date | None:
+    """Accept ``None``, a ``date``, ``'today'``/``'yesterday'``, or ISO ``YYYY-MM-DD``.
+
+    Relative names resolve against the *account's* timezone rather than the
+    host's. A server in UTC would otherwise roll over to "tomorrow" while the
+    user is still having dinner, silently logging food to the wrong day.
+    """
     if value is None or isinstance(value, date):
         return value
     text = value.strip().lower()
     if not text or text == "today":
-        return date.today()
+        return account_today(hours_from_gmt)
     if text == "yesterday":
-        return date.fromordinal(date.today().toordinal() - 1)
+        return account_today(hours_from_gmt) - timedelta(days=1)
     try:
-        return datetime.strptime(text, "%Y-%m-%d").date()
+        # A calendar date carries no time or zone of its own; the account
+        # offset is applied by the caller where it matters.
+        return datetime.strptime(text, "%Y-%m-%d").date()  # noqa: DTZ007
     except ValueError as exc:
         raise ValueError(
             f"Invalid date {value!r}; use YYYY-MM-DD, 'today', or 'yesterday'."
         ) from exc
 
 
+def account_today(hours_from_gmt: int | None) -> date:
+    """Today's date in the account's timezone."""
+    if hours_from_gmt is None:
+        # No configured offset — the host's local date is the best guess.
+        return date.today()  # noqa: DTZ011
+    return datetime.now(tz=timezone(timedelta(hours=hours_from_gmt))).date()
+
+
 class LoseItService:
-    """A logged-in Lose It! client with auto-refreshing credentials."""
+    """A logged-in Lose It! client with auto-refreshing credentials.
+
+    Instances are safe to share across threads: lifecycle transitions (first
+    login, re-authentication, shutdown) are serialized by a lock, so a
+    re-auth triggered by one caller cannot close a client another caller is
+    mid-request on.
+    """
 
     def __init__(self, settings: Settings):
         self._settings = settings
         self._session: Session | None = None
         self._client: LoseIt | None = None
+        self._lock = threading.RLock()
 
     # ── Lifecycle ───────────────────────────────────────────────────────
 
     @property
     def session(self) -> Session:
-        if self._session is None:
-            self._session = resolve_session(self._settings)
-        return self._session
+        with self._lock:
+            if self._session is None:
+                self._session = resolve_session(self._settings)
+            return self._session
 
     @property
     def client(self) -> LoseIt:
-        if self._client is None:
-            self._client = self._build_client(self.session)
-        return self._client
+        with self._lock:
+            if self._client is None:
+                self._client = self._build_client(self.session)
+            return self._client
 
     def _build_client(self, session: Session) -> LoseIt:
         config = Config.model_construct(
@@ -107,24 +173,46 @@ class LoseItService:
 
     def _reauthenticate(self) -> None:
         """Force a fresh login and rebuild the underlying client."""
-        self.close()
-        self._session = resolve_session(self._settings, force_login=True)
-        self._client = self._build_client(self._session)
+        with self._lock:
+            self.close()
+            # Clear first: if the login below fails, we must not leave the
+            # rejected session in place for the next call to rebuild from.
+            self._session = None
+            session = resolve_session(self._settings, force_login=True)
+            self._session = session
+            self._client = self._build_client(session)
+
+    def _retrying(self, fn: Callable[[], _T]) -> _T:
+        """Run ``fn``, retrying once after re-authenticating on auth failure."""
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_auth_failure(exc):
+                raise
+            self._reauthenticate()
+            return fn()
 
     def _call(self, fn_name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke an SDK method, retrying once after a re-login on auth failure."""
-        try:
-            return getattr(self.client, fn_name)(*args, **kwargs)
-        except LoseItAuthError:
-            self._reauthenticate()
-            return getattr(self.client, fn_name)(*args, **kwargs)
+        return self._retrying(lambda: getattr(self.client, fn_name)(*args, **kwargs))
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        with self._lock:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
 
-    def __enter__(self) -> LoseItService:
+    # ── Dates ───────────────────────────────────────────────────────────
+
+    def _parse(self, value: str | date | None) -> date | None:
+        """Parse a date argument against the account's timezone."""
+        return _parse_date(value, self._settings.hours_from_gmt)
+
+    def _day(self, value: str | date | None) -> date:
+        """Resolve a date argument, defaulting to today in the account's zone."""
+        return self._parse(value) or account_today(self._settings.hours_from_gmt)
+
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -153,7 +241,7 @@ class LoseItService:
 
     def get_diary(self, when: str | date | None = None) -> dict[str, Any]:
         """All food log entries for a day."""
-        day = _parse_date(when) or date.today()
+        day = self._day(when)
         entries = self._call("diary", day)
         items = [_entry_to_dict(e) for e in entries]
         return {
@@ -177,12 +265,25 @@ class LoseItService:
 
         Supply either ``servings`` (a canonical multiplier) or the pair
         ``serving_amount`` + ``serving_unit`` (e.g. ``120`` + ``"g"``).
+
+        Combining the two, or giving only half of the amount/unit pair, is
+        rejected rather than silently resolved — guessing wrong here logs the
+        wrong quantity of food, which the caller has no easy way to notice.
         """
-        if servings is None and serving_amount is None:
-            servings = 1.0
+        if (serving_amount is None) != (serving_unit is None):
+            raise ValueError(
+                "serving_amount and serving_unit must be supplied together "
+                "(e.g. 120 and 'g')."
+            )
+        if serving_amount is not None and servings is not None:
+            raise ValueError(
+                "Specify a portion either as servings OR as "
+                "serving_amount + serving_unit, not both."
+            )
+
         kwargs: dict[str, Any] = {
             "meal": meal,
-            "when": _parse_date(when),
+            "when": self._day(when),
             "dry_run": dry_run,
         }
         if serving_amount is not None:
@@ -190,7 +291,7 @@ class LoseItService:
             kwargs["serving_unit"] = serving_unit
             kwargs["servings"] = 1.0
         else:
-            kwargs["servings"] = servings
+            kwargs["servings"] = 1.0 if servings is None else servings
         return _to_dict(self._call("log_food", food_id, **kwargs))
 
     def log_custom_food(
@@ -240,9 +341,18 @@ class LoseItService:
         }
 
         meal_ordinal = int(MealType.parse(meal))
-        day = _parse_date(when) or date.today()
+        day = self._day(when)
 
-        result = {
+        # Report only what actually reaches the wire, so the caller is never
+        # told a nutrient was recorded when the payload builder dropped it.
+        sent = {ord_: v for ord_, v in nutrients.items() if ord_ in _SENDABLE_ORDINALS}
+        ignored = sorted(
+            label
+            for label, ord_ in _NUTRIENT_ORDINALS.items()
+            if ord_ in nutrients and ord_ not in _SENDABLE_ORDINALS
+        )
+
+        result: dict[str, Any] = {
             "action": "log_custom",
             "dry_run": dry_run,
             "date": day.isoformat(),
@@ -253,13 +363,19 @@ class LoseItService:
             "nutrients": {
                 label: round(value * servings, 2)
                 for label, ord_ in _NUTRIENT_ORDINALS.items()
-                if (value := nutrients.get(ord_)) is not None
+                if (value := sent.get(ord_)) is not None
             },
         }
+        if ignored:
+            result["ignored_nutrients"] = ignored
+            result["warning"] = (
+                f"Not recorded (unsupported by the upstream payload builder): "
+                f"{', '.join(ignored)}."
+            )
         if dry_run:
             return result
 
-        self._log_custom(name, brand, nutrients, meal_ordinal, day, servings)
+        self._log_custom(name, brand, sent, meal_ordinal, day, servings)
         return result
 
     def _log_custom(
@@ -290,11 +406,7 @@ class LoseItService:
             )
             _entries.log_food(http, unsaved, meal_ordinal, day_key, day_num, servings)
 
-        try:
-            send()
-        except LoseItAuthError:
-            self._reauthenticate()
-            send()
+        self._retrying(send)
 
     def log_weight(
         self,
@@ -307,7 +419,7 @@ class LoseItService:
         The unit follows the account's display setting (lb or kg); the API
         carries no unit itself.
         """
-        day = _parse_date(when) or date.today()
+        day = self._day(when)
         result: dict[str, Any] = {
             "action": "weigh_in",
             "dry_run": dry_run,
@@ -317,13 +429,41 @@ class LoseItService:
         if dry_run:
             return result
 
-        try:
-            saved = save_weight(self.client.http, weight, day)
-        except LoseItAuthError:
-            self._reauthenticate()
-            saved = save_weight(self.client.http, weight, day)
+        saved = self._retrying(lambda: save_weight(self.client.http, weight, day))
         result["weight"] = saved
         return result
+
+    def get_weight_history(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        days: int = 30,
+    ) -> dict[str, Any]:
+        """Return recorded weigh-ins over a date range.
+
+        Defaults to the last ``days`` days ending today. Explicit ``start`` /
+        ``end`` override that.
+        """
+        end_date = self._day(end)
+        start_date = self._parse(start) or (end_date - timedelta(days=max(days, 1) - 1))
+
+        entries = self._retrying(
+            lambda: _get_weight_history(self.client.http, start_date, end_date)
+        )
+
+        weights = [e["weight"] for e in entries]
+        summary: dict[str, Any] = {
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "count": len(entries),
+            "entries": entries,
+        }
+        if weights:
+            summary["latest"] = weights[-1]
+            summary["min"] = min(weights)
+            summary["max"] = max(weights)
+            summary["change"] = round(weights[-1] - weights[0], 2)
+        return summary
 
     def delete_entry(
         self,
@@ -336,7 +476,7 @@ class LoseItService:
         what the caller saw. A recoverable trash record is written before the
         wire delete (an upstream SDK invariant).
         """
-        day = _parse_date(when) or date.today()
+        day = self._day(when)
         entries = self._call("diary", day)
         match = next((e for e in entries if _entry_id(e) == entry_id), None)
         if match is None:

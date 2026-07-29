@@ -16,6 +16,7 @@ An MCP server and CLI for logging food to [Lose It!](https://www.loseit.com/).
 | `log_food` | Log a database food to a meal |
 | `log_custom_food` | Log arbitrary calories/macros with no database match |
 | `log_weight` | Record a weigh-in |
+| `get_weight_history` | Read weigh-ins over a range, with min/max/change |
 | `delete_entry` | Delete a diary entry |
 | `whoami` | Show the authenticated account |
 
@@ -83,6 +84,7 @@ loseit-mcp diary 2026-07-25
 loseit-mcp log <food_id> -m lunch -a 120 -u g
 loseit-mcp log-custom "Caesar Salad" 620 -m lunch -b "Gastrohub" -p 46 -c 18 -f 40
 loseit-mcp weigh 199.2
+loseit-mcp weights -n 14
 loseit-mcp delete <entry_id> -d 2026-07-25
 ```
 
@@ -94,6 +96,15 @@ Add `--dry-run` to either log command to preview the math without writing, and
 - Deleting writes a recoverable copy to local trash before the wire call.
 - Weights carry no unit over the wire; the number is interpreted in whatever
   unit the account displays (lb or kg).
+- **`saturated_fat_g` is not recorded.** The upstream SDK's payload builder
+  filters that nutrient ordinal out, so `log_custom_food` reports it in an
+  `ignored_nutrients` field rather than claiming to have logged it. Every other
+  macro goes through.
+- Weight history is fetched in windows and bisected further when a response is
+  too large for the SDK decoder — an unchunked year-long query would otherwise
+  silently return "no weigh-ins".
+- Relative dates (`today` / `yesterday`) resolve in the *account's* timezone,
+  not the host's, so a server in another region doesn't log to the wrong day.
 - Fractional portions of database foods can display a misleading unit (half a
   banana rendering as "1/4 Each") because the server's canonical serving count
   differs from the food's native unit. Calories stay correct, but `log-custom`

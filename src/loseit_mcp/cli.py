@@ -140,6 +140,11 @@ def build_parser() -> argparse.ArgumentParser:
     weigh.add_argument("-d", "--date", help="Day to record (default: today).")
     weigh.add_argument("--dry-run", action="store_true", help="Preview without writing.")
 
+    weights = sub.add_parser("weights", help="Show weigh-in history.")
+    weights.add_argument("-s", "--start", help="First day (YYYY-MM-DD).")
+    weights.add_argument("-e", "--end", help="Last day (YYYY-MM-DD, default: today).")
+    weights.add_argument("-n", "--days", type=int, default=30, help="Window size.")
+
     delete = sub.add_parser("delete", help="Delete a diary entry.")
     delete.add_argument("entry_id", help="entry_id from the diary command.")
     delete.add_argument("-d", "--date", help="Day the entry is on (default: today).")
@@ -191,10 +196,14 @@ def _print_diary(day: dict[str, Any]) -> None:
 def _print_logged(result: dict[str, Any]) -> None:
     prefix = "DRY RUN — would log" if result.get("dry_run") else "Logged"
     food = result.get("food") or {}
+    # Calories are None for foods that carry no calorie data (raw produce,
+    # condiments); the write has already happened by now, so never crash here.
+    calories = result.get("calories")
+    suffix = f" ({calories:.0f} cal)" if isinstance(calories, int | float) else ""
     print(
         f"{prefix}: {food.get('name')} — {result.get('portion_size')} "
-        f"{result.get('measure_unit')} to {result.get('meal')} on {result.get('date')} "
-        f"({result.get('calories'):.0f} cal)"
+        f"{result.get('measure_unit')} to {result.get('meal')} on {result.get('date')}"
+        f"{suffix}"
     )
 
 
@@ -284,6 +293,8 @@ def _run_command(args: argparse.Namespace, settings: Settings) -> int:
                     f"{prefix}: {food['name']}{brand} to {result['meal']} "
                     f"on {result['date']} ({result['calories']:g} cal)"
                 )
+                if result.get("warning"):
+                    print(f"  warning: {result['warning']}")
 
         elif args.command == "weigh":
             result = svc.log_weight(args.weight, when=args.date, dry_run=args.dry_run)
@@ -292,6 +303,20 @@ def _run_command(args: argparse.Namespace, settings: Settings) -> int:
             else:
                 prefix = "DRY RUN — would record" if result["dry_run"] else "Recorded"
                 print(f"{prefix}: {result['weight']:g} on {result['date']}")
+
+        elif args.command == "weights":
+            hist = svc.get_weight_history(start=args.start, end=args.end, days=args.days)
+            if as_json:
+                _print_json(hist)
+            else:
+                print(f"{hist['start']} to {hist['end']} — {hist['count']} weigh-ins")
+                for e in hist["entries"]:
+                    print(f"  {e['date']}  {e['weight']:g}")
+                if hist["count"]:
+                    print(
+                        f"\nlatest {hist['latest']:g} | min {hist['min']:g} | "
+                        f"max {hist['max']:g} | change {hist['change']:+g}"
+                    )
 
         elif args.command == "delete":
             result = svc.delete_entry(args.entry_id, when=args.date)

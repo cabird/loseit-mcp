@@ -11,10 +11,10 @@ services:
       # Credential URLs, for clients that cannot send auth headers.
       LOSEIT_ENROLLMENT: "1"
       # Seals and opens those URLs. Rotating it invalidates every issued URL.
-      # Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      # Generate with: loseit-mcp gen-secret
       LOSEIT_URL_SECRET: "${LOSEIT_URL_SECRET:?set LOSEIT_URL_SECRET}"
-      # Required to call POST /enroll.
-      LOSEIT_ENROLL_SECRET: "${LOSEIT_ENROLL_SECRET:?set LOSEIT_ENROLL_SECRET}"
+      # Enrollment is open by default. Uncomment to restrict it.
+      # LOSEIT_ENROLL_SECRET: "${LOSEIT_ENROLL_SECRET:-}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"]
       interval: 30s

@@ -25,6 +25,13 @@ from typing import Any
 from .config import ConfigError, Settings, load_settings
 from .sealed import UrlSealer
 from .service import LoseItService
+from .throttle import (
+    ENROLL_LIMIT,
+    MCP_LIMIT,
+    ThrottleMiddleware,
+    describe,
+    limit_from_env,
+)
 
 
 def _add_credential_flags(parser: argparse.ArgumentParser) -> None:
@@ -274,14 +281,12 @@ def _build_sealer(settings: Settings) -> UrlSealer | None:
         raise ConfigError(
             "LOSEIT_ENROLLMENT requires LOSEIT_URL_SECRET — it is the key that "
             "seals and opens credential URLs. Generate one with: "
-            'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            "loseit-mcp gen-secret"
         )
-    if not os.environ.get("LOSEIT_ENROLL_SECRET"):
-        raise ConfigError(
-            "LOSEIT_ENROLLMENT requires LOSEIT_ENROLL_SECRET. An open /enroll "
-            "endpoint lets anyone mint working credential URLs. Set it and send "
-            "it as the X-Enroll-Secret header."
-        )
+    # LOSEIT_ENROLL_SECRET is optional. Enrolling requires already knowing the
+    # account password and never contacts Lose It, so an open endpoint exposes
+    # nothing; throttling covers the abuse case. Set it to keep an instance
+    # private.
     return UrlSealer(secret.encode("utf-8"))
 
 
@@ -372,9 +377,22 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
     if sealer is not None:
         app = PathTokenMiddleware(app, mount_path=args.path)
 
+    # Throttling wraps everything, so it runs before routing and before any
+    # credential work. Health probes are exempt.
+    enroll_limit = limit_from_env("LOSEIT_ENROLL_RATE", ENROLL_LIMIT)
+    mcp_limit = limit_from_env("LOSEIT_MCP_RATE", MCP_LIMIT)
+    app = ThrottleMiddleware(
+        app,
+        enroll_limit=enroll_limit,
+        mcp_limit=mcp_limit,
+        trusted_proxies=int(os.environ.get("LOSEIT_TRUSTED_PROXIES", "1")),
+    )
+
     print(
         f"Serving MCP ({mode}) over streamable HTTP at "
-        f"http://{args.host}:{args.port}{args.path}",
+        f"http://{args.host}:{args.port}{args.path}\n"
+        f"  throttle: /enroll {describe(enroll_limit)}, "
+        f"tools {describe(mcp_limit)} per client",
         file=sys.stderr,
     )
 

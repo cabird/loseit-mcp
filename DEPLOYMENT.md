@@ -54,11 +54,9 @@ Then, from your machine, ask the server for a URL:
 loseit-mcp enroll https://<host>
 ```
 
-It prompts for your Lose It! email and password and the server's
-`LOSEIT_ENROLL_SECRET` — none of which are accepted as command-line flags,
-since argv lands in shell history and process listings. Set `LOSEIT_EMAIL`,
-`LOSEIT_PASSWORD`, or `LOSEIT_ENROLL_SECRET` in the environment to skip a
-prompt.
+It prompts for your Lose It! email and password — neither is accepted as a
+command-line flag, since argv lands in shell history and process listings. Set
+`LOSEIT_EMAIL` or `LOSEIT_PASSWORD` in the environment to skip a prompt.
 
 ```
 Add this to your MCP client configuration:
@@ -72,12 +70,23 @@ The equivalent raw request, if you'd rather not use the CLI:
 
 ```console
 curl -X POST https://<host>/enroll \
-  -H 'x-enroll-secret: <LOSEIT_ENROLL_SECRET>' \
   -H 'content-type: application/json' \
   -d '{"email":"you@example.com","password":"...","hours_from_gmt":-7}'
 ```
 
 Nothing is stored to produce the URL.
+
+#### Enrollment is open by default
+
+Anyone can enroll, because being able to enroll grants nothing: you must
+already know the account password, and sealing never contacts Lose It — the
+server encrypts whatever it is handed and returns 201 regardless. That last
+property is what makes an open endpoint safe: **`/enroll` is not a password
+oracle**, so it cannot be used to test credentials against Lose It.
+
+Set `LOSEIT_ENROLL_SECRET` to lock an instance down anyway; clients then send
+it as an `X-Enroll-Secret` header. That is a reasonable choice for a private
+deployment, but it is not what protects users' data — the URL secret is.
 
 #### The URL carries the credentials, encrypted
 
@@ -120,8 +129,35 @@ its own logs, but Azure's platform logging is separate. Mitigate by:
 - keeping a bounded `ttl_days` so a leaked URL dies on its own
 - rotating `LOSEIT_URL_SECRET` if one leaks
 
-`LOSEIT_ENROLL_SECRET` is required: an open `/enroll` on a public host lets
-anyone mint working URLs for any account whose password they already have.
+## Throttling
+
+Requests are rate-limited per client with a token bucket: a burst is allowed,
+then requests are admitted at the refill rate. Two budgets, because the paths
+cost very different amounts:
+
+| Path | Default | Why |
+| --- | --- | --- |
+| `/enroll` | 5 per hour | Rare in normal use; cheap to serve but easy to abuse in bulk |
+| everything else | 120 per minute | Tool calls are chatty, but a cache miss costs an upstream Lose It login |
+| `/healthz` | exempt | Azure probes it continuously; throttling it would flap the instance |
+
+Override with `LOSEIT_ENROLL_RATE` / `LOSEIT_MCP_RATE`, written as
+`capacity/seconds` (e.g. `10/3600`). Rejections return 429 with `Retry-After`.
+
+Clients are identified by IP. Behind a proxy that means `X-Forwarded-For`,
+which accumulates left to right — so the **rightmost** entries were added by
+infrastructure we control, and the leftmost is whatever the client claimed.
+Reading the leftmost would let anyone mint unlimited budget by sending a
+header, so the server counts back from the right by `LOSEIT_TRUSTED_PROXIES`
+(default 1, correct for App Service).
+
+State is in memory and bounded to 10,000 tracked clients, evicting idle buckets
+first, so the throttle cannot itself be used to exhaust memory. Scaling past one
+instance would want a shared store; the `Throttle` class is small enough to swap.
+
+This is not a DDoS defence — it protects a small instance from casual abuse and
+keeps us from hammering Lose It. Genuinely hostile load belongs behind a gateway
+or WAF.
 
 ### Session caching (both options)
 
@@ -269,7 +305,7 @@ az role assignment create \
 ### 4. Secrets in Key Vault
 
 ```console
-loseit-mcp gen-secret        # run twice: one URL secret, one enroll secret
+loseit-mcp gen-secret        # run once for the URL secret
 
 az keyvault create --name <vault> --resource-group loseit-mcp-rg \
   --location westus --enable-rbac-authorization true
@@ -278,8 +314,7 @@ az role assignment create --assignee <your-user-object-id> \
   --scope $(az keyvault show --name <vault> --query id -o tsv) \
   --role "Key Vault Secrets Officer"
 
-az keyvault secret set --vault-name <vault> --name loseit-url-secret    --value <secret-1>
-az keyvault secret set --vault-name <vault> --name loseit-enroll-secret --value <secret-2>
+az keyvault secret set --vault-name <vault> --name loseit-url-secret --value <secret>
 
 az role assignment create \
   --assignee $(az webapp identity show --name <app-name> \
@@ -287,6 +322,9 @@ az role assignment create \
   --scope $(az keyvault show --name <vault> --query id -o tsv) \
   --role "Key Vault Secrets User"
 ```
+
+Add a second secret for `LOSEIT_ENROLL_SECRET` only if you want to restrict who
+may enroll; it is optional.
 
 ### 5. App settings
 
@@ -298,8 +336,7 @@ az webapp config appsettings set \
              WEBSITES_PORT=8000 \
              LOSEIT_HOURS_FROM_GMT=-7 \
              LOSEIT_ALLOWED_HOSTS=<app-name>.azurewebsites.net \
-             "LOSEIT_URL_SECRET=@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/loseit-url-secret/)" \
-             "LOSEIT_ENROLL_SECRET=@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/loseit-enroll-secret/)"
+             "LOSEIT_URL_SECRET=@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/loseit-url-secret/)"
 ```
 
 > **`LOSEIT_ALLOWED_HOSTS` is not optional.** The MCP transport validates the
@@ -324,7 +361,9 @@ az webapp restart --resource-group loseit-mcp-rg --name <app-name>
 
 ```console
 curl https://<app-name>.azurewebsites.net/healthz          # {"status":"ok"}
-curl -X POST https://<app-name>.azurewebsites.net/enroll   # 403 without the secret
+curl -X POST https://<app-name>.azurewebsites.net/enroll \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@example.com","password":"..."}'        # 201 with a URL
 ```
 
 Then get a URL and use it:
@@ -399,7 +438,10 @@ With a credential URL (no headers needed):
 | `LOSEIT_MULTI_TENANT` | `1` in the image | Take credentials from each request |
 | `LOSEIT_ENROLLMENT` | unset | Enable credential URLs and `POST /enroll` |
 | `LOSEIT_URL_SECRET` | — | Seals/opens credential URLs. **Required** for enrollment |
-| `LOSEIT_ENROLL_SECRET` | — | Required to call `/enroll`. **Required** for enrollment |
+| `LOSEIT_ENROLL_SECRET` | unset | Optional. Restricts `/enroll` to holders of this value |
+| `LOSEIT_ENROLL_RATE` | `5/3600` | `/enroll` budget, as `capacity/seconds` |
+| `LOSEIT_MCP_RATE` | `120/60` | Tool-call budget, as `capacity/seconds` |
+| `LOSEIT_TRUSTED_PROXIES` | `1` | Proxies in front of the app, for client-IP resolution |
 | `LOSEIT_CACHE_SECRET` | random per process | Session-cache key material |
 | `LOSEIT_ALLOWED_HOSTS` | `WEBSITE_HOSTNAME`, else localhost | Comma-separated hostnames the MCP endpoint will answer on |
 | `PORT` | `8000` | Listen port |

@@ -54,9 +54,12 @@ def enroll(
 ) -> dict[str, Any]:
     """Request a credential URL and return the server's response.
 
-    ``email`` is prompted for if omitted. The password comes from
-    ``LOSEIT_PASSWORD`` or a hidden prompt; the enrollment secret from
-    ``LOSEIT_ENROLL_SECRET`` or a hidden prompt.
+    ``email`` is prompted for if omitted; the password comes from
+    ``LOSEIT_PASSWORD`` or a hidden prompt.
+
+    ``LOSEIT_ENROLL_SECRET`` is sent when set. Most servers leave enrollment
+    open — it requires the account password anyway — so we don't prompt for one
+    speculatively; if the server does want it, it says so with a 403.
     """
     base = server.rstrip("/")
     parsed = urlparse(base)
@@ -70,9 +73,6 @@ def enroll(
 
     email = email or os.environ.get("LOSEIT_EMAIL") or _prompt("Lose It! email", secret=False)
     password = os.environ.get("LOSEIT_PASSWORD") or _prompt("Lose It! password", secret=True)
-    enroll_secret = os.environ.get("LOSEIT_ENROLL_SECRET") or _prompt(
-        "Server enrollment secret", secret=True
-    )
 
     payload: dict[str, Any] = {
         "email": email,
@@ -82,21 +82,24 @@ def enroll(
     if ttl_days is not None:
         payload["ttl_days"] = ttl_days
 
+    headers = {}
+    enroll_secret = os.environ.get("LOSEIT_ENROLL_SECRET")
+    if enroll_secret:
+        headers["x-enroll-secret"] = enroll_secret
+
     try:
-        response = httpx.post(
-            f"{base}/enroll",
-            json=payload,
-            headers={"x-enroll-secret": enroll_secret},
-            timeout=timeout,
-        )
+        response = httpx.post(f"{base}/enroll", json=payload, headers=headers, timeout=timeout)
     except httpx.HTTPError as exc:
         raise EnrollClientError(f"Could not reach {base}: {exc}") from exc
 
     if response.status_code == 403:
         raise EnrollClientError(
-            "The server rejected the enrollment secret. Check "
-            "LOSEIT_ENROLL_SECRET matches the server's setting."
+            "This server restricts enrollment. Set LOSEIT_ENROLL_SECRET to the "
+            "value its operator configured and try again."
         )
+    if response.status_code == 429:
+        retry = _error_detail(response)
+        raise EnrollClientError(f"The server is rate-limiting enrollment: {retry}")
     if response.status_code == 404:
         raise EnrollClientError(
             f"{base}/enroll was not found. The server may not have credential "

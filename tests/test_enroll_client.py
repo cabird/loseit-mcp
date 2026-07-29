@@ -147,11 +147,23 @@ class TestErrorHandling:
     def _fail(self, monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -> None:
         monkeypatch.setattr(httpx, "post", lambda url, **kw: response)
 
-    def test_forbidden_names_the_enroll_secret(
+    def test_forbidden_explains_the_server_is_restricted(
         self, creds: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Enrollment is open by default, so a 403 means this operator chose to
+        lock it down — say that rather than implying a misconfiguration."""
         self._fail(monkeypatch, httpx.Response(403, json={"error": "no"}))
-        with pytest.raises(EnrollClientError, match="enrollment secret"):
+        with pytest.raises(EnrollClientError, match="restricts enrollment"):
+            enroll("https://example.com")
+
+    def test_rate_limiting_is_reported(
+        self, creds: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._fail(
+            monkeypatch,
+            httpx.Response(429, json={"error": "Too many requests.", "retry_after_seconds": 60}),
+        )
+        with pytest.raises(EnrollClientError, match="rate-limiting"):
             enroll("https://example.com")
 
     def test_not_found_suggests_enabling_enrollment(

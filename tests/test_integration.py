@@ -136,12 +136,12 @@ class TestToolErrorSurfacing:
         assert "together" in str(caught.value)
 
 
-def _http_app(sealer: UrlSealer, settings: Settings) -> Any:
+def _http_app(sealer: UrlSealer, settings: Settings, *, enroll_secret: str | None = None) -> Any:
     from loseit_mcp.cli import _add_health_route
 
     mcp = build_server(settings, multi_tenant=True, sealer=sealer)
     _add_health_route(mcp)
-    add_enrollment_route(mcp, sealer, mount_path="/mcp", enroll_secret="s3cret")
+    add_enrollment_route(mcp, sealer, mount_path="/mcp", enroll_secret=enroll_secret)
     return PathTokenMiddleware(mcp.streamable_http_app(streamable_http_path="/mcp"))
 
 
@@ -149,7 +149,7 @@ class TestEnrollmentEndpoints:
     @pytest.fixture
     def client(self, settings: Settings) -> Any:
         sealer = UrlSealer(b"kJ8x2mQ7vN4pL9wR3tY6uZ1aS5dF0gH8cV7bN2mX")
-        with TestClient(_http_app(sealer, settings)) as client:
+        with TestClient(_http_app(sealer, settings, enroll_secret="s3cret")) as client:
             client.sealer = sealer  # type: ignore[attr-defined]
             yield client
 
@@ -214,7 +214,7 @@ class TestPathTokenRouting:
     @pytest.fixture
     def client(self, settings: Settings) -> Any:
         sealer = UrlSealer(b"kJ8x2mQ7vN4pL9wR3tY6uZ1aS5dF0gH8cV7bN2mX")
-        with TestClient(_http_app(sealer, settings)) as client:
+        with TestClient(_http_app(sealer, settings, enroll_secret="s3cret")) as client:
             client.sealer = sealer  # type: ignore[attr-defined]
             yield client
 

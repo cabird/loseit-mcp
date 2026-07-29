@@ -22,8 +22,10 @@ from typing import Any
 
 from .auth import AuthError, login
 from .config import Settings
+from .enrollment import EnrollmentError, EnrollmentRegistry
 from .service import LoseItService
 from .tokencache import TokenCache
+from .webapp import current_path_token
 
 EMAIL_HEADER = "x-loseit-email"
 PASSWORD_HEADER = "x-loseit-password"
@@ -58,6 +60,30 @@ def _decode_basic(value: str) -> Credentials | None:
     return Credentials(email=email, password=password)
 
 
+def _offset_from_headers(headers: Any) -> int | None:
+    """Parse the timezone-offset header, independently of credential source.
+
+    Kept separate so a client using an enrollment URL can still override the
+    offset, and so a malformed value is reported rather than silently dropped
+    on the way to the token fallback.
+    """
+    try:
+        raw = headers.get(TZ_OFFSET_HEADER)
+    except AttributeError:
+        return None
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise CredentialsError(
+            f"'{TZ_OFFSET_HEADER}' must be a whole number of hours, got {raw!r}."
+        ) from exc
+    if not -12 <= parsed <= 14:
+        raise CredentialsError(f"'{TZ_OFFSET_HEADER}' must be between -12 and 14, got {parsed}.")
+    return parsed
+
+
 def credentials_from_headers(headers: Any) -> Credentials:
     """Extract credentials from a request's headers.
 
@@ -72,31 +98,16 @@ def credentials_from_headers(headers: Any) -> Credentials:
             return None
         return value if isinstance(value, str) and value else None
 
-    raw_offset = get(TZ_OFFSET_HEADER)
-    offset: int | None = None
-    if raw_offset is not None:
-        try:
-            parsed = int(raw_offset)
-        except ValueError as exc:
-            raise CredentialsError(
-                f"'{TZ_OFFSET_HEADER}' must be a whole number of hours, got {raw_offset!r}."
-            ) from exc
-        if not -12 <= parsed <= 14:
-            raise CredentialsError(
-                f"'{TZ_OFFSET_HEADER}' must be between -12 and 14, got {parsed}."
-            )
-        offset = parsed
-
     authorization = get("authorization")
     if authorization:
         creds = _decode_basic(authorization)
         if creds is not None:
-            return replace(creds, hours_from_gmt=offset)
+            return creds
 
     email = get(EMAIL_HEADER)
     password = get(PASSWORD_HEADER)
     if email and password:
-        return Credentials(email=email.strip(), password=password, hours_from_gmt=offset)
+        return Credentials(email=email.strip(), password=password)
 
     raise CredentialsError(
         "No Lose It! credentials on the request. Send either "
@@ -134,16 +145,71 @@ class SessionResolver:
             user_id=session.user_id,
             user_name=session.user_name,
             hours_from_gmt=creds.hours_from_gmt,
+            # The on-disk session cache is process-wide, so in multi-tenant
+            # serving it would collect whichever tenant re-authenticated last.
+            # TokenCache already provides this caching, per-credential.
+            persist_session=False,
         )
-        return LoseItService(settings)
+        service = LoseItService(settings)
+
+        # If the cached JWT turns out to be dead (revoked rather than expired,
+        # e.g. the password changed on another device), the service re-logs in
+        # transparently. Without this hook the stale entry would survive and
+        # every request would pay a fresh login until it expired on its own.
+        service.on_reauthenticated = lambda new_session: self._cache.put(
+            creds.email, creds.password, new_session
+        )
+        return service
 
     def invalidate(self, creds: Credentials) -> None:
         self._cache.invalidate(creds.email, creds.password)
 
 
-def resolve_or_raise(resolver: SessionResolver, headers: Any) -> tuple[LoseItService, Credentials]:
+def credentials_from_request(
+    headers: Any,
+    registry: EnrollmentRegistry | None = None,
+) -> Credentials:
+    """Resolve credentials for a request, from headers or a path token.
+
+    Headers win when present. Otherwise, if the request arrived on a
+    ``/u/<token>/`` path and an enrollment registry is configured, the token is
+    exchanged for the credentials it stands for.
+
+    The timezone offset header is honoured either way, and overrides whatever
+    the enrollment recorded — it is the only knob a URL-only client has left.
+    """
+    # Parsed first so a malformed offset is reported rather than swallowed by
+    # the fallback to the path token.
+    offset = _offset_from_headers(headers)
+
+    try:
+        creds = credentials_from_headers(headers)
+    except CredentialsError:
+        token = current_path_token()
+        if registry is None or token is None:
+            raise
+        try:
+            data = registry.resolve(token)
+        except EnrollmentError as exc:
+            raise CredentialsError(str(exc)) from exc
+        creds = Credentials(
+            email=str(data["email"]),
+            password=str(data.get("password") or ""),
+            hours_from_gmt=data.get("hours_from_gmt"),
+        )
+
+    if offset is not None:
+        creds = replace(creds, hours_from_gmt=offset)
+    return creds
+
+
+def resolve_or_raise(
+    resolver: SessionResolver,
+    headers: Any,
+    registry: EnrollmentRegistry | None = None,
+) -> tuple[LoseItService, Credentials]:
     """Resolve a service for a request, mapping auth failures to clear errors."""
-    creds = credentials_from_headers(headers)
+    creds = credentials_from_request(headers, registry)
     try:
         return resolver.resolve(creds), creds
     except AuthError as exc:

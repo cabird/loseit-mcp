@@ -65,6 +65,12 @@ class Settings:
 
     session_file: Path = DEFAULT_SESSION_FILE
 
+    # Whether a resolved session may be written to (and read from) the on-disk
+    # cache. Must be False in multi-tenant serving: the path is process-wide,
+    # so tenants would otherwise persist their live JWTs to a shared file,
+    # clobbering each other and defeating encryption-at-rest for enrollments.
+    persist_session: bool = True
+
     def with_overrides(self, **kwargs: Any) -> Settings:
         """Return a copy with non-``None`` keyword arguments applied."""
         clean = {k: v for k, v in kwargs.items() if v is not None}

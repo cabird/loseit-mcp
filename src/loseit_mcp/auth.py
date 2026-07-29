@@ -254,7 +254,7 @@ def resolve_session(settings: Settings, *, force_login: bool = False) -> Session
         )
 
     if not force_login:
-        cached = load_cached_session(settings.session_file)
+        cached = load_cached_session(settings.session_file) if settings.persist_session else None
         if cached and _matches_configured_account(cached, settings):
             return _apply_overrides(cached, settings)
 
@@ -265,7 +265,8 @@ def resolve_session(settings: Settings, *, force_login: bool = False) -> Session
 
     session = login(settings.email, settings.password)  # type: ignore[arg-type]
     session = _apply_overrides(session, settings)
-    save_session(session, settings.session_file)
+    if settings.persist_session:
+        save_session(session, settings.session_file)
     return session
 
 

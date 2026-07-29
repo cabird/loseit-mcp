@@ -22,6 +22,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from pydantic import Field
 
 from .config import Settings
+from .enrollment import EnrollmentRegistry
 from .service import LoseItService
 from .tenancy import SessionResolver, resolve_or_raise
 
@@ -45,13 +46,19 @@ Deleting: call `get_diary` first to get an `entry_id`, then `delete_entry`.
 """
 
 
-def build_server(settings: Settings, *, multi_tenant: bool = False) -> MCPServer:
+def build_server(
+    settings: Settings,
+    *,
+    multi_tenant: bool = False,
+    registry: EnrollmentRegistry | None = None,
+) -> MCPServer:
     """Construct the MCP server.
 
-    With ``multi_tenant`` set, each request must carry Lose It! credentials
-    (``Authorization: Basic`` or ``X-LoseIt-Email`` / ``X-LoseIt-Password``) and
-    gets its own service instance, so concurrent callers never share state.
-    Otherwise a single service is built from ``settings`` and shared.
+    With ``multi_tenant`` set, each request must identify an account — either
+    with credential headers or, when ``registry`` is supplied, via a
+    ``/u/<token>/`` enrollment URL. Each request gets its own service instance,
+    so concurrent callers never share state. Otherwise a single service is
+    built from ``settings`` and shared.
     """
     shared: LoseItService | None = None
     resolver: SessionResolver | None = None
@@ -67,7 +74,7 @@ def build_server(settings: Settings, *, multi_tenant: bool = False) -> MCPServer
             assert shared is not None
             yield shared
             return
-        service, _ = resolve_or_raise(resolver, ctx.headers or {})
+        service, _ = resolve_or_raise(resolver, ctx.headers or {}, registry)
         try:
             yield service
         finally:

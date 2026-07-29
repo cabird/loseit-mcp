@@ -21,3 +21,7 @@ captures/
 
 # Scratch/debug files
 scratch_*.py
+
+# Local enrollment store
+enrollments.json
+test-enroll.json

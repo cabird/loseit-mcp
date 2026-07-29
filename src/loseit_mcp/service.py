@@ -142,6 +142,9 @@ class LoseItService:
         self._session: Session | None = None
         self._client: LoseIt | None = None
         self._lock = threading.RLock()
+        # Optional hook so a caller-managed cache can be refreshed when we mint
+        # a new session behind its back. Set by the multi-tenant resolver.
+        self.on_reauthenticated: Callable[[Session], None] | None = None
 
     # ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -181,6 +184,11 @@ class LoseItService:
             session = resolve_session(self._settings, force_login=True)
             self._session = session
             self._client = self._build_client(session)
+
+        if self.on_reauthenticated is not None:
+            # Outside the lock: the callback belongs to the caller and must not
+            # be able to deadlock this service.
+            self.on_reauthenticated(session)
 
     def _retrying(self, fn: Callable[[], _T]) -> _T:
         """Run ``fn``, retrying once after re-authenticating on auth failure."""

@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, Settings, load_settings
+from .enrollment import EnrollmentRegistry
 from .service import LoseItService
 
 
@@ -220,47 +222,101 @@ def _print_logged(result: dict[str, Any]) -> None:
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 
+def _build_registry(settings: Settings) -> EnrollmentRegistry | None:
+    """Build the enrollment registry when URL-token auth is enabled."""
+    if os.environ.get("LOSEIT_ENROLLMENT", "").lower() not in ("1", "true", "yes"):
+        return None
+
+    from .config import CONFIG_DIR
+    from .enrollment import FileEnrollmentStore
+
+    secret = os.environ.get("LOSEIT_CACHE_SECRET")
+    if not secret:
+        raise ConfigError(
+            "LOSEIT_ENROLLMENT requires LOSEIT_CACHE_SECRET. Without a stable "
+            "secret every restart would orphan all issued URLs."
+        )
+    if not os.environ.get("LOSEIT_ENROLL_SECRET"):
+        raise ConfigError(
+            "LOSEIT_ENROLLMENT requires LOSEIT_ENROLL_SECRET. An open /enroll "
+            "endpoint lets anyone mint records against a shared store. Set it "
+            "and send it as the X-Enroll-Secret header."
+        )
+    path = Path(os.environ.get("LOSEIT_ENROLLMENT_PATH") or CONFIG_DIR / "enrollments.json")
+    registry = EnrollmentRegistry(FileEnrollmentStore(path), secret.encode("utf-8"))
+    registry.purge_expired()
+    return registry
+
+
 def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
+    import uvicorn
+
     from .server import build_server
+    from .webapp import PathTokenMiddleware, add_enrollment_routes, install_log_redaction
 
     multi_tenant = getattr(args, "multi_tenant", False)
+    registry = _build_registry(settings) if multi_tenant else None
 
     # In multi-tenant mode credentials come from each request, so the process
     # itself needs none — and shouldn't be started with any.
     if not multi_tenant:
         settings.require_credentials()
 
-    mcp = build_server(settings, multi_tenant=multi_tenant)
-
     if args.transport == "stdio":
         if multi_tenant:
             print(
-                "error: --multi-tenant needs per-request headers, which stdio "
+                "error: --multi-tenant needs per-request context, which stdio "
                 "has none of. Use --transport streamable-http.",
                 file=sys.stderr,
             )
             return 2
-        mcp.run("stdio")
+        build_server(settings).run("stdio")
         return 0
 
+    mcp = build_server(settings, multi_tenant=multi_tenant, registry=registry)
+    _add_health_route(mcp)
+    if registry is not None:
+        add_enrollment_routes(
+            mcp,
+            registry,
+            mount_path=args.path,
+            enroll_secret=os.environ.get("LOSEIT_ENROLL_SECRET"),
+        )
+
     mode = "multi-tenant" if multi_tenant else "single-account"
-    if args.transport == "streamable-http":
-        print(
-            f"Serving MCP ({mode}) over streamable HTTP at "
-            f"http://{args.host}:{args.port}{args.path}",
-            file=sys.stderr,
-        )
-        _add_health_route(mcp)
-        mcp.run(
-            "streamable-http",
-            host=args.host,
-            port=args.port,
-            streamable_http_path=args.path,
-        )
-    else:
+    if registry is not None:
+        mode += " + enrollment URLs"
+
+    if args.transport == "sse":
         print(f"Serving MCP ({mode}) over SSE at http://{args.host}:{args.port}", file=sys.stderr)
-        _add_health_route(mcp)
         mcp.run("sse", host=args.host, port=args.port)
+        return 0
+
+    app = mcp.streamable_http_app(streamable_http_path=args.path)
+    if registry is not None:
+        # Wrap so /u/<token>{path} resolves to the same MCP mount point.
+        app = PathTokenMiddleware(app, mount_path=args.path)
+
+    print(
+        f"Serving MCP ({mode}) over streamable HTTP at "
+        f"http://{args.host}:{args.port}{args.path}",
+        file=sys.stderr,
+    )
+
+    if registry is None:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        return 0
+
+    # Own the logging config so redaction survives: uvicorn's own dictConfig
+    # replaces handlers during startup, which would drop filters installed
+    # beforehand. Tokens are decryption keys, so this has to be reliable.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s:     %(message)s",
+        force=True,
+    )
+    install_log_redaction()
+    uvicorn.run(app, host=args.host, port=args.port, log_config=None)
     return 0
 
 

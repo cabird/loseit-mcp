@@ -197,6 +197,22 @@ def build_server(settings: Settings) -> MCPServer:
     ) -> dict[str, Any]:
         return service.delete_entry(entry_id, when=date)
 
+    @mcp.tool(
+        description=(
+            "Record a weigh-in for a day. The unit follows the account's display "
+            "setting (lb or kg)."
+        )
+    )
+    def log_weight(
+        weight: Annotated[float, Field(description="Body weight in the account's unit.", gt=0)],
+        date: Annotated[
+            str | None,
+            Field(description="Day to record: 'YYYY-MM-DD', 'today', or 'yesterday'."),
+        ] = None,
+        dry_run: Annotated[bool, Field(description="Preview without writing.")] = False,
+    ) -> dict[str, Any]:
+        return service.log_weight(weight, when=date, dry_run=dry_run)
+
     @mcp.tool(description="Show which Lose It! account this server is authenticated as.")
     def whoami() -> dict[str, Any]:
         return service.whoami()

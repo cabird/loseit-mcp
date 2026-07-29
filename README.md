@@ -15,6 +15,7 @@ An MCP server and CLI for logging food to [Lose It!](https://www.loseit.com/).
 | `get_diary` | A day's entries with calories and macros, plus totals |
 | `log_food` | Log a database food to a meal |
 | `log_custom_food` | Log arbitrary calories/macros with no database match |
+| `log_weight` | Record a weigh-in |
 | `delete_entry` | Delete a diary entry |
 | `whoami` | Show the authenticated account |
 
@@ -81,6 +82,7 @@ loseit-mcp describe <food_id>
 loseit-mcp diary 2026-07-25
 loseit-mcp log <food_id> -m lunch -a 120 -u g
 loseit-mcp log-custom "Caesar Salad" 620 -m lunch -b "Gastrohub" -p 46 -c 18 -f 40
+loseit-mcp weigh 199.2
 loseit-mcp delete <entry_id> -d 2026-07-25
 ```
 
@@ -90,6 +92,8 @@ Add `--dry-run` to either log command to preview the math without writing, and
 ## Notes
 
 - Deleting writes a recoverable copy to local trash before the wire call.
+- Weights carry no unit over the wire; the number is interpreted in whatever
+  unit the account displays (lb or kg).
 - Fractional portions of database foods can display a misleading unit (half a
   banana rendering as "1/4 Each") because the server's canonical serving count
   differs from the food's native unit. Calories stay correct, but `log-custom`
@@ -101,4 +105,5 @@ The GWT-RPC wire format is handled by the
 [`phitoduck/lose-it`](https://github.com/phitoduck/lose-it) SDK. This project
 adds email/password authentication (the SDK expects you to supply a JWT
 yourself, and its browser-cookie import does not support Windows), the
-custom-food logging path, and the MCP server and CLI layers.
+custom-food logging path, weight recording via `saveRecordedWeight` (captured
+from the web app's weigh-in widget), and the MCP server and CLI layers.

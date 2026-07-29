@@ -135,6 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
     custom.add_argument("-d", "--date", help="Day to log to (default: today).")
     custom.add_argument("--dry-run", action="store_true", help="Preview without writing.")
 
+    weigh = sub.add_parser("weigh", help="Record a weigh-in.")
+    weigh.add_argument("weight", type=float, help="Body weight in the account's unit.")
+    weigh.add_argument("-d", "--date", help="Day to record (default: today).")
+    weigh.add_argument("--dry-run", action="store_true", help="Preview without writing.")
+
     delete = sub.add_parser("delete", help="Delete a diary entry.")
     delete.add_argument("entry_id", help="entry_id from the diary command.")
     delete.add_argument("-d", "--date", help="Day the entry is on (default: today).")
@@ -279,6 +284,14 @@ def _run_command(args: argparse.Namespace, settings: Settings) -> int:
                     f"{prefix}: {food['name']}{brand} to {result['meal']} "
                     f"on {result['date']} ({result['calories']:g} cal)"
                 )
+
+        elif args.command == "weigh":
+            result = svc.log_weight(args.weight, when=args.date, dry_run=args.dry_run)
+            if as_json:
+                _print_json(result)
+            else:
+                prefix = "DRY RUN — would record" if result["dry_run"] else "Recorded"
+                print(f"{prefix}: {result['weight']:g} on {result['date']}")
 
         elif args.command == "delete":
             result = svc.delete_entry(args.entry_id, when=args.date)

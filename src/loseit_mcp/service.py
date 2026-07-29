@@ -23,6 +23,7 @@ from lose_it.core.daily import get_daydate_key
 
 from .auth import Session, resolve_session
 from .config import Settings
+from .weight import save_weight
 
 # FoodNutrient enum ordinals the server accepts inside a logged entry.
 _NUTRIENT_ORDINALS = {
@@ -294,6 +295,35 @@ class LoseItService:
         except LoseItAuthError:
             self._reauthenticate()
             send()
+
+    def log_weight(
+        self,
+        weight: float,
+        when: str | date | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Record a weigh-in for a day.
+
+        The unit follows the account's display setting (lb or kg); the API
+        carries no unit itself.
+        """
+        day = _parse_date(when) or date.today()
+        result: dict[str, Any] = {
+            "action": "weigh_in",
+            "dry_run": dry_run,
+            "date": day.isoformat(),
+            "weight": weight,
+        }
+        if dry_run:
+            return result
+
+        try:
+            saved = save_weight(self.client.http, weight, day)
+        except LoseItAuthError:
+            self._reauthenticate()
+            saved = save_weight(self.client.http, weight, day)
+        result["weight"] = saved
+        return result
 
     def delete_entry(
         self,

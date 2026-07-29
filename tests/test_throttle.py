@@ -11,11 +11,13 @@ import threading
 import pytest
 
 from loseit_mcp.throttle import (
+    CREDENTIAL_LIMIT,
     ENROLL_LIMIT,
     MCP_LIMIT,
     Limit,
     Throttle,
     client_key,
+    credential_key,
     describe,
     limit_from_env,
 )
@@ -145,6 +147,56 @@ class TestClientIdentification:
         assert client_key({"type": "http", "path": "/mcp", "headers": []}) == "unknown"
 
 
+class TestCredentialIdentification:
+    """An address is a weak identity — a rotating NAT pool defeats it. The
+    credential a request carries does not rotate."""
+
+    SEALED = "A" * 60
+
+    def test_sealed_url_yields_a_key(self) -> None:
+        key = credential_key(_scope(f"/u/{self.SEALED}/mcp"))
+        assert key is not None
+        assert key.startswith("u:")
+
+    def test_the_same_url_always_yields_the_same_key(self) -> None:
+        a = credential_key(_scope(f"/u/{self.SEALED}/mcp"))
+        b = credential_key(_scope(f"/u/{self.SEALED}/mcp", client="203.0.113.99"))
+        assert a == b, "the key must not depend on the address"
+
+    def test_different_urls_yield_different_keys(self) -> None:
+        assert credential_key(_scope(f"/u/{'A' * 60}/mcp")) != credential_key(
+            _scope(f"/u/{'B' * 60}/mcp")
+        )
+
+    def test_the_credential_is_never_the_key(self) -> None:
+        """Bucket keys must not carry anything sensitive."""
+        key = credential_key(_scope(f"/u/{self.SEALED}/mcp"))
+        assert self.SEALED not in key
+
+    def test_authorization_header_yields_a_key(self) -> None:
+        key = credential_key(_scope("/mcp", authorization="Basic dXNlcjpwdw=="))
+        assert key is not None
+        assert key.startswith("h:")
+        assert "dXNlcjpwdw==" not in key
+
+    def test_password_header_yields_a_key(self) -> None:
+        key = credential_key(_scope("/mcp", x_loseit_password="hunter2"))
+        assert key is not None
+        assert "hunter2" not in key
+
+    def test_header_and_url_keys_cannot_collide(self) -> None:
+        url_key = credential_key(_scope(f"/u/{self.SEALED}/mcp"))
+        header_key = credential_key(_scope("/mcp", authorization="Basic x"))
+        assert url_key[:2] != header_key[:2]
+
+    def test_unauthenticated_requests_have_no_key(self) -> None:
+        assert credential_key(_scope("/mcp")) is None
+        assert credential_key(_scope("/enroll")) is None
+
+    def test_short_path_segments_are_not_treated_as_credentials(self) -> None:
+        assert credential_key(_scope("/u/short/mcp")) is None
+
+
 class TestConfiguredLimits:
     def test_enrollment_is_tighter_than_tool_calls(self) -> None:
         assert ENROLL_LIMIT.refill_rate < MCP_LIMIT.refill_rate
@@ -154,6 +206,11 @@ class TestConfiguredLimits:
         assert MCP_LIMIT.capacity >= 60
         # Enrolling is a once-in-a-while action.
         assert ENROLL_LIMIT.capacity <= 10
+
+    def test_credential_limit_is_a_backstop_not_a_ceiling(self) -> None:
+        """It exists to catch address rotation, so a client on one address must
+        hit the address limit first and never notice this one."""
+        assert CREDENTIAL_LIMIT.refill_rate >= MCP_LIMIT.refill_rate
 
     def test_env_override_is_parsed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TEST_RATE", "7/120")

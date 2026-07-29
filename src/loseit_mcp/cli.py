@@ -26,6 +26,7 @@ from .config import ConfigError, Settings, load_settings
 from .sealed import UrlSealer
 from .service import LoseItService
 from .throttle import (
+    CREDENTIAL_LIMIT,
     ENROLL_LIMIT,
     MCP_LIMIT,
     ThrottleMiddleware,
@@ -381,10 +382,12 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
     # credential work. Health probes are exempt.
     enroll_limit = limit_from_env("LOSEIT_ENROLL_RATE", ENROLL_LIMIT)
     mcp_limit = limit_from_env("LOSEIT_MCP_RATE", MCP_LIMIT)
+    credential_limit = limit_from_env("LOSEIT_CREDENTIAL_RATE", CREDENTIAL_LIMIT)
     app = ThrottleMiddleware(
         app,
         enroll_limit=enroll_limit,
         mcp_limit=mcp_limit,
+        credential_limit=credential_limit,
         trusted_proxies=int(os.environ.get("LOSEIT_TRUSTED_PROXIES", "1")),
     )
 
@@ -392,7 +395,8 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
         f"Serving MCP ({mode}) over streamable HTTP at "
         f"http://{args.host}:{args.port}{args.path}\n"
         f"  throttle: /enroll {describe(enroll_limit)}, "
-        f"tools {describe(mcp_limit)} per client",
+        f"tools {describe(mcp_limit)} per address; "
+        f"{describe(credential_limit)} per credential",
         file=sys.stderr,
     )
 
@@ -415,12 +419,33 @@ def _add_health_route(mcp: Any) -> None:
     Deliberately unauthenticated and dependency-free: it reports that the
     process is serving, not that Lose It! is reachable, so a Lose It outage
     doesn't cause the platform to kill otherwise-healthy instances.
+
+    It also reports the running build, so "is my change actually deployed?" is
+    answerable from outside the box rather than inferred from logs. The
+    ``client`` block echoes how the server resolved the caller's address, which
+    is what rate limiting keys on — the one piece of state that behaves
+    differently behind a proxy and is otherwise invisible.
     """
+    from starlette.requests import Request
     from starlette.responses import JSONResponse
 
+    from . import build_info
+    from .throttle import client_key
+
+    trusted = int(os.environ.get("LOSEIT_TRUSTED_PROXIES", "1"))
+
     @mcp.custom_route("/healthz", methods=["GET"])
-    async def healthz(_request: Any) -> JSONResponse:
-        return JSONResponse({"status": "ok"})
+    async def healthz(request: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "build": build_info(),
+                "client": {
+                    "resolved": client_key(request.scope, trusted),
+                    "trusted_proxies": trusted,
+                },
+            }
+        )
 
 
 def _run_command(args: argparse.Namespace, settings: Settings) -> int:

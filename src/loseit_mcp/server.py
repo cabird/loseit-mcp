@@ -313,6 +313,50 @@ def build_server(
         with acquire(ctx) as svc:
             return svc.get_weight_history(start=start, end=end, days=days)
 
+    @mcp.tool(
+        description=(
+            "Report the health and configuration of this MCP server: version, "
+            "build, connectivity to Lose It, and which account the current "
+            "request resolves to. Use this to diagnose problems — if other "
+            "tools are failing, this says whether the cause is the server, the "
+            "credentials, or Lose It itself."
+        )
+    )
+    def server_status(ctx: Context) -> dict[str, Any]:
+        from . import build_info
+
+        status: dict[str, Any] = {
+            "server": "loseit-mcp",
+            "build": build_info(),
+            "mode": "multi-tenant" if resolver is not None else "single-account",
+            "credential_urls_enabled": sealer is not None,
+        }
+
+        # Resolving credentials and making a live call are separate failure
+        # modes, so report them separately rather than collapsing both into a
+        # single "unhealthy".
+        try:
+            with acquire(ctx) as svc:
+                identity = svc.whoami()
+                status["authenticated"] = True
+                status["account"] = {
+                    "user_name": identity.get("user_name"),
+                    "email": identity.get("email"),
+                    "hours_from_gmt": identity.get("hours_from_gmt"),
+                }
+                try:
+                    svc.search_food("water", limit=1)
+                    status["loseit_reachable"] = True
+                except Exception as exc:  # noqa: BLE001 - reported, not raised
+                    status["loseit_reachable"] = False
+                    status["loseit_error"] = str(translate(exc))[:400]
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            status["authenticated"] = False
+            status["auth_error"] = str(translate(exc))[:400]
+
+        status["ok"] = bool(status.get("authenticated") and status.get("loseit_reachable"))
+        return status
+
     @mcp.tool(description="Show which Lose It! account this server is authenticated as.")
     def whoami(ctx: Context) -> dict[str, Any]:
         with acquire(ctx) as svc:

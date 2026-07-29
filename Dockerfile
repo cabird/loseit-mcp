@@ -58,6 +58,15 @@ USER app
 
 EXPOSE 8000
 
+# Stamped at build time so the running container can report exactly what it is.
+# Last, so changing them doesn't invalidate any earlier layer.
+ARG BUILD_COMMIT=unknown
+ARG BUILD_TIME=unknown
+ARG BUILD_TAG=unknown
+ENV LOSEIT_BUILD_COMMIT=${BUILD_COMMIT} \
+    LOSEIT_BUILD_TIME=${BUILD_TIME} \
+    LOSEIT_BUILD_TAG=${BUILD_TAG}
+
 # Azure App Service pings the root path; the server answers /healthz.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import os,urllib.request,sys; \

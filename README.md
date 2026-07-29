@@ -106,6 +106,10 @@ loseit-mcp enroll https://<host>           # get a credential URL for a client
 - When Lose It changes their private API, tools return an explanation of what
   broke and what the operator needs to refresh, rather than a decoder
   traceback — see `errors.py`.
+- Hosted deployments rate-limit per client address *and* per credential, since
+  an address alone is a weak identity behind a NAT pool.
+- `/healthz` reports the running version and commit, so you can tell what is
+  actually deployed without reading logs.
 - Weights carry no unit over the wire; the number is interpreted in whatever
   unit the account displays (lb or kg).
 - **`saturated_fat_g` is not recorded.** The upstream SDK's payload builder

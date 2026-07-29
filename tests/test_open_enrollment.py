@@ -19,6 +19,7 @@ SECRET = b"kJ8x2mQ7vN4pL9wR3tY6uZ1aS5dF0gH8cV7bN2mX"
 
 ENROLL_TEST_LIMIT = Limit(3, 3600)
 MCP_TEST_LIMIT = Limit(5, 60)
+CREDENTIAL_TEST_LIMIT = Limit(1000, 60)
 
 
 def _app(
@@ -27,6 +28,7 @@ def _app(
     enroll_secret: str | None = None,
     enroll_limit: Limit | None = None,
     mcp_limit: Limit | None = None,
+    credential_limit: Limit | None = None,
 ) -> Any:
     sealer = UrlSealer(SECRET)
     mcp = build_server(settings, multi_tenant=True, sealer=sealer)
@@ -37,6 +39,7 @@ def _app(
         app,
         enroll_limit=enroll_limit or ENROLL_TEST_LIMIT,
         mcp_limit=mcp_limit or MCP_TEST_LIMIT,
+        credential_limit=credential_limit or CREDENTIAL_TEST_LIMIT,
     )
 
 
@@ -135,6 +138,47 @@ class TestEnrollThrottling:
                 headers={"X-Forwarded-For": "10.0.0.99, 203.0.113.5"},
             )
             assert blocked.status_code == 429
+
+
+class TestCredentialThrottling:
+    """The point of the credential budget: rotating addresses must not grant a
+    fresh budget to the same user."""
+
+    def test_rotating_addresses_still_hits_the_credential_limit(
+        self, settings: Settings
+    ) -> None:
+        sealed = UrlSealer(SECRET).seal("u@example.com", "pw")
+        app = _app(
+            settings,
+            mcp_limit=Limit(2, 60),          # small per-address budget
+            credential_limit=Limit(5, 60),   # backstop across addresses
+        )
+        with TestClient(app) as client:
+            codes = []
+            for i in range(10):
+                # Every request appears to come from a different address.
+                codes.append(
+                    client.get(
+                        f"/u/{sealed}/mcp",
+                        headers={"X-Forwarded-For": f"203.0.113.{i}"},
+                    ).status_code
+                )
+            assert codes.count(429) >= 4, (
+                "address rotation should stop being effective once the "
+                f"credential budget is spent; got {codes}"
+            )
+
+    def test_distinct_credentials_have_distinct_budgets(self, settings: Settings) -> None:
+        sealer = UrlSealer(SECRET)
+        a = sealer.seal("alice@example.com", "pw")
+        b = sealer.seal("bob@example.com", "pw")
+        app = _app(settings, mcp_limit=Limit(100, 60), credential_limit=Limit(2, 60))
+        with TestClient(app) as client:
+            for _ in range(3):
+                client.get(f"/u/{a}/mcp")
+            # Alice is throttled; Bob is unaffected.
+            assert client.get(f"/u/{a}/mcp").status_code == 429
+            assert client.get(f"/u/{b}/mcp").status_code != 429
 
 
 class TestMcpThrottling:

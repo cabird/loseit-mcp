@@ -131,33 +131,86 @@ its own logs, but Azure's platform logging is separate. Mitigate by:
 
 ## Throttling
 
-Requests are rate-limited per client with a token bucket: a burst is allowed,
-then requests are admitted at the refill rate. Two budgets, because the paths
-cost very different amounts:
+Requests are rate-limited with token buckets: a burst is allowed, then requests
+are admitted at the refill rate. Every request is limited by client address, and
+requests carrying a credential are limited by that too — both applicable budgets
+must allow the request.
 
-| Path | Default | Why |
+| Scope | Key | Default |
 | --- | --- | --- |
-| `/enroll` | 5 per hour | Rare in normal use; cheap to serve but easy to abuse in bulk |
-| everything else | 120 per minute | Tool calls are chatty, but a cache miss costs an upstream Lose It login |
-| `/healthz` | exempt | Azure probes it continuously; throttling it would flap the instance |
+| `/enroll` | address | 5 per hour |
+| tool calls | address | 120 per minute |
+| tool calls | credential | 200 per minute |
+| `/healthz` | — | exempt |
 
-Override with `LOSEIT_ENROLL_RATE` / `LOSEIT_MCP_RATE`, written as
-`capacity/seconds` (e.g. `10/3600`). Rejections return 429 with `Retry-After`.
+Enrollment is rare in normal use, so a tight budget costs nobody anything. Tool
+calls are chatty during a conversation but a session-cache miss triggers an
+upstream Lose It login, so that budget is generous rather than open.
 
-Clients are identified by IP. Behind a proxy that means `X-Forwarded-For`,
-which accumulates left to right — so the **rightmost** entries were added by
-infrastructure we control, and the leftmost is whatever the client claimed.
-Reading the leftmost would let anyone mint unlimited budget by sending a
-header, so the server counts back from the right by `LOSEIT_TRUSTED_PROXIES`
-(default 1, correct for App Service).
+**Why two keys.** An address is a weak identity: a client whose egress rotates
+across a NAT pool gets one budget per address. This is not hypothetical — twelve
+requests from one machine to this service arrived from six different addresses.
+The credential a request carries does not rotate, so it gives a limit that
+follows the *user* rather than the connection. The credential budget is set
+above the address one so it acts as a backstop rather than a second ceiling a
+normal client would notice. Credential keys are SHA-256 hashes; the credential
+itself never enters the bucket store.
 
-State is in memory and bounded to 10,000 tracked clients, evicting idle buckets
-first, so the throttle cannot itself be used to exhaust memory. Scaling past one
-instance would want a shared store; the `Throttle` class is small enough to swap.
+Override with `LOSEIT_ENROLL_RATE`, `LOSEIT_MCP_RATE`, and
+`LOSEIT_CREDENTIAL_RATE`, written as `capacity/seconds` (e.g. `10/3600`).
+Rejections return 429 with `Retry-After`.
+
+Behind a proxy, the address comes from `X-Forwarded-For`, which accumulates left
+to right — so the **rightmost** entries were added by infrastructure we control,
+and the leftmost is whatever the client claimed. Reading the leftmost would let
+anyone mint unlimited budget by sending a header, so the server counts back from
+the right by `LOSEIT_TRUSTED_PROXIES` (default 1, correct for App Service).
+
+State is in memory and bounded to 10,000 tracked clients per bucket, evicting
+idle entries first, so the throttle cannot itself be used to exhaust memory.
+Scaling past one instance would want a shared store; the `Throttle` class is
+small enough to swap.
 
 This is not a DDoS defence — it protects a small instance from casual abuse and
 keeps us from hammering Lose It. Genuinely hostile load belongs behind a gateway
 or WAF.
+
+## Checking what is deployed
+
+`/healthz` reports the running build and how the server resolved the caller's
+address:
+
+```console
+curl https://<host>/healthz
+```
+
+```json
+{
+  "status": "ok",
+  "build": {
+    "version": "0.3.6",
+    "commit": "2e39845",
+    "built_at": "2026-07-29T14:56:02Z",
+    "image_tag": "v4"
+  },
+  "client": { "resolved": "203.0.113.7", "trusted_proxies": 1 }
+}
+```
+
+The build stamp makes "is my change actually live?" answerable from outside the
+box instead of inferred from logs. The `client` block exposes the one piece of
+state that behaves differently behind a proxy and is otherwise invisible — it is
+what rate limiting keys on.
+
+Stamp the values at build time:
+
+```console
+docker build \
+  --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --build-arg BUILD_TAG=v5 \
+  -t <registry>.azurecr.io/loseit-mcp:v5 .
+```
 
 ### Session caching (both options)
 
@@ -439,8 +492,9 @@ With a credential URL (no headers needed):
 | `LOSEIT_ENROLLMENT` | unset | Enable credential URLs and `POST /enroll` |
 | `LOSEIT_URL_SECRET` | — | Seals/opens credential URLs. **Required** for enrollment |
 | `LOSEIT_ENROLL_SECRET` | unset | Optional. Restricts `/enroll` to holders of this value |
-| `LOSEIT_ENROLL_RATE` | `5/3600` | `/enroll` budget, as `capacity/seconds` |
-| `LOSEIT_MCP_RATE` | `120/60` | Tool-call budget, as `capacity/seconds` |
+| `LOSEIT_ENROLL_RATE` | `5/3600` | `/enroll` budget per address, as `capacity/seconds` |
+| `LOSEIT_MCP_RATE` | `120/60` | Tool-call budget per address |
+| `LOSEIT_CREDENTIAL_RATE` | `200/60` | Tool-call budget per credential |
 | `LOSEIT_TRUSTED_PROXIES` | `1` | Proxies in front of the app, for client-IP resolution |
 | `LOSEIT_CACHE_SECRET` | random per process | Session-cache key material |
 | `LOSEIT_ALLOWED_HOSTS` | `WEBSITE_HOSTNAME`, else localhost | Comma-separated hostnames the MCP endpoint will answer on |

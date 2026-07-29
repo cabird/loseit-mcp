@@ -28,6 +28,7 @@ EXPECTED_TOOLS = {
     "delete_entry",
     "log_weight",
     "get_weight_history",
+    "server_status",
     "whoami",
 }
 
@@ -207,7 +208,13 @@ class TestEnrollmentEndpoints:
     def test_healthz_is_open(self, client: Any) -> None:
         response = client.get("/healthz")
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        body = response.json()
+        assert body["status"] == "ok"
+        # The build stamp is what makes "is my change deployed?" answerable
+        # from outside the box.
+        assert body["build"]["version"]
+        # And the resolved client address is what rate limiting keys on.
+        assert body["client"]["resolved"]
 
 
 class TestPathTokenRouting:

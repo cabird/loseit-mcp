@@ -19,8 +19,10 @@ which suits a single instance; scaling out would want a shared store, and the
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -47,6 +49,11 @@ ENROLL_LIMIT = Limit(capacity=5, per_seconds=3600)
 # Tool calls are the common path and can be chatty during a conversation, but
 # each cache miss costs an upstream login, so this is generous rather than open.
 MCP_LIMIT = Limit(capacity=120, per_seconds=60)
+
+# Per-credential budget, applied on top of the address one. Sized above the
+# address limit so it acts as a backstop against rotation rather than a second
+# ceiling a normal client would notice.
+CREDENTIAL_LIMIT = Limit(capacity=200, per_seconds=60)
 
 # Cap tracked clients so the throttle itself can't be used to exhaust memory.
 MAX_TRACKED_CLIENTS = 10_000
@@ -120,6 +127,11 @@ def client_key(scope: Scope, trusted_proxies: int = 1) -> str:
     client claimed. Reading the leftmost would let anyone bypass throttling by
     sending a header, so we count back from the right by the number of proxies
     actually in front of us.
+
+    Note that an address is a weak identity: a client whose egress rotates
+    across a NAT pool gets one budget per address. That is why authenticated
+    traffic is *also* throttled per credential (see
+    :func:`credential_key`), which no amount of address rotation affects.
     """
     headers = dict(scope.get("headers") or [])
     forwarded = headers.get(b"x-forwarded-for", b"").decode("latin-1")
@@ -152,8 +164,44 @@ def _strip_port(value: str) -> str | None:
         return text[:64] or None
 
 
+def credential_key(scope: Scope) -> str | None:
+    """A stable per-user key for authenticated requests, or ``None``.
+
+    Addresses make a weak identity — a client behind a rotating NAT pool gets a
+    fresh budget per address. The credential a request carries does not rotate,
+    so throttling on it as well gives a limit that follows the *user* rather
+    than the connection.
+
+    The key is a hash, never the credential itself, so nothing sensitive lands
+    in the bucket store. Sealed URLs and credential headers are distinguished by
+    prefix so they can't collide.
+    """
+    path = scope.get("path", "")
+    match = _TOKEN_PATH_RE.match(path)
+    if match:
+        return "u:" + hashlib.sha256(match.group(1).encode("ascii")).hexdigest()[:32]
+
+    headers = dict(scope.get("headers") or [])
+    for name in (b"authorization", b"x-loseit-password"):
+        value = headers.get(name)
+        if value:
+            return "h:" + hashlib.sha256(value).hexdigest()[:32]
+    return None
+
+
+# Matches the sealed segment in /u/<sealed>/... so the credential can be keyed
+# on before any routing or decryption happens.
+_TOKEN_PATH_RE = re.compile(r"^/u/([A-Za-z0-9_-]{32,})")
+
+
 class ThrottleMiddleware:
     """Applies per-path throttles, answering 429 with ``Retry-After``.
+
+    Every request is limited by client address. Requests that carry a
+    credential are limited by that too, and both budgets must allow the
+    request. The two cover each other's gaps: an address bucket catches
+    unauthenticated floods, while a credential bucket follows a single user
+    across a rotating NAT pool, which an address bucket cannot.
 
     Pure ASGI so it can run ahead of routing and leave streaming responses
     alone.
@@ -165,16 +213,18 @@ class ThrottleMiddleware:
         *,
         enroll_limit: Limit = ENROLL_LIMIT,
         mcp_limit: Limit = MCP_LIMIT,
+        credential_limit: Limit = CREDENTIAL_LIMIT,
         trusted_proxies: int = 1,
         exempt_paths: tuple[str, ...] = ("/healthz",),
     ):
         self._app = app
         self._enroll = Throttle(enroll_limit)
         self._mcp = Throttle(mcp_limit)
+        self._credential = Throttle(credential_limit)
         self._trusted_proxies = trusted_proxies
         self._exempt = exempt_paths
 
-    def _throttle_for(self, path: str) -> Throttle | None:
+    def _address_throttle(self, path: str) -> Throttle | None:
         if path in self._exempt:
             return None
         if path == "/enroll":
@@ -186,12 +236,19 @@ class ThrottleMiddleware:
             await self._app(scope, receive, send)
             return
 
-        throttle = self._throttle_for(scope.get("path", ""))
-        if throttle is None:
+        path = scope.get("path", "")
+        by_address = self._address_throttle(path)
+        if by_address is None:
             await self._app(scope, receive, send)
             return
 
-        retry_after = throttle.check(client_key(scope, self._trusted_proxies))
+        retry_after = by_address.check(client_key(scope, self._trusted_proxies))
+
+        if retry_after is None:
+            credential = credential_key(scope)
+            if credential is not None:
+                retry_after = self._credential.check(credential)
+
         if retry_after is None:
             await self._app(scope, receive, send)
             return
@@ -243,12 +300,14 @@ def describe(limit: Limit) -> str:
 
 
 __all__ = [
+    "CREDENTIAL_LIMIT",
     "ENROLL_LIMIT",
     "MCP_LIMIT",
     "Limit",
     "Throttle",
     "ThrottleMiddleware",
     "client_key",
+    "credential_key",
     "describe",
     "limit_from_env",
 ]

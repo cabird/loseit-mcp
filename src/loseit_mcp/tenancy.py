@@ -22,7 +22,7 @@ from typing import Any
 
 from .auth import AuthError, login
 from .config import Settings
-from .enrollment import EnrollmentError, EnrollmentRegistry
+from .sealed import SealError, UrlSealer
 from .service import LoseItService
 from .tokencache import TokenCache
 from .webapp import current_path_token
@@ -167,35 +167,34 @@ class SessionResolver:
 
 def credentials_from_request(
     headers: Any,
-    registry: EnrollmentRegistry | None = None,
+    sealer: UrlSealer | None = None,
 ) -> Credentials:
-    """Resolve credentials for a request, from headers or a path token.
+    """Resolve credentials for a request, from headers or a sealed URL.
 
     Headers win when present. Otherwise, if the request arrived on a
-    ``/u/<token>/`` path and an enrollment registry is configured, the token is
-    exchanged for the credentials it stands for.
+    ``/u/<sealed>/`` path and a sealer is configured, the segment is decrypted.
 
     The timezone offset header is honoured either way, and overrides whatever
-    the enrollment recorded — it is the only knob a URL-only client has left.
+    the URL was sealed with — it is the only knob a URL-only client has left.
     """
     # Parsed first so a malformed offset is reported rather than swallowed by
-    # the fallback to the path token.
+    # the fallback to the sealed URL.
     offset = _offset_from_headers(headers)
 
     try:
         creds = credentials_from_headers(headers)
     except CredentialsError:
-        token = current_path_token()
-        if registry is None or token is None:
+        sealed = current_path_token()
+        if sealer is None or sealed is None:
             raise
         try:
-            data = registry.resolve(token)
-        except EnrollmentError as exc:
+            opened = sealer.open(sealed)
+        except SealError as exc:
             raise CredentialsError(str(exc)) from exc
         creds = Credentials(
-            email=str(data["email"]),
-            password=str(data.get("password") or ""),
-            hours_from_gmt=data.get("hours_from_gmt"),
+            email=opened.email,
+            password=opened.password,
+            hours_from_gmt=opened.hours_from_gmt,
         )
 
     if offset is not None:
@@ -206,10 +205,10 @@ def credentials_from_request(
 def resolve_or_raise(
     resolver: SessionResolver,
     headers: Any,
-    registry: EnrollmentRegistry | None = None,
+    sealer: UrlSealer | None = None,
 ) -> tuple[LoseItService, Credentials]:
     """Resolve a service for a request, mapping auth failures to clear errors."""
-    creds = credentials_from_request(headers, registry)
+    creds = credentials_from_request(headers, sealer)
     try:
         return resolver.resolve(creds), creds
     except AuthError as exc:

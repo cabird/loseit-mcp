@@ -5,12 +5,16 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Credentials arrive per request; the container holds none.
+      # Credentials arrive per request; the container stores nothing.
       LOSEIT_MULTI_TENANT: "1"
       PORT: "8000"
-      # Pin the cache key secret so cached sessions survive a restart. Generate
-      # with: python -c "import secrets; print(secrets.token_urlsafe(32))"
-      LOSEIT_CACHE_SECRET: "${LOSEIT_CACHE_SECRET:-dev-only-not-for-production}"
+      # Credential URLs, for clients that cannot send auth headers.
+      LOSEIT_ENROLLMENT: "1"
+      # Seals and opens those URLs. Rotating it invalidates every issued URL.
+      # Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      LOSEIT_URL_SECRET: "${LOSEIT_URL_SECRET:?set LOSEIT_URL_SECRET}"
+      # Required to call POST /enroll.
+      LOSEIT_ENROLL_SECRET: "${LOSEIT_ENROLL_SECRET:?set LOSEIT_ENROLL_SECRET}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"]
       interval: 30s
@@ -18,6 +22,7 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    # Nothing is written to disk, so the filesystem can stay read-only.
     read_only: true
     security_opt:
       - no-new-privileges:true

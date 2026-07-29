@@ -22,7 +22,8 @@ from mcp.server.mcpserver import Context, MCPServer
 from pydantic import Field
 
 from .config import Settings
-from .enrollment import EnrollmentRegistry
+from .errors import translate
+from .sealed import UrlSealer
 from .service import LoseItService
 from .tenancy import SessionResolver, resolve_or_raise
 
@@ -50,13 +51,13 @@ def build_server(
     settings: Settings,
     *,
     multi_tenant: bool = False,
-    registry: EnrollmentRegistry | None = None,
+    sealer: UrlSealer | None = None,
 ) -> MCPServer:
     """Construct the MCP server.
 
     With ``multi_tenant`` set, each request must identify an account — either
-    with credential headers or, when ``registry`` is supplied, via a
-    ``/u/<token>/`` enrollment URL. Each request gets its own service instance,
+    with credential headers or, when ``sealer`` is supplied, via a
+    ``/u/<sealed>/`` credential URL. Each request gets its own service instance,
     so concurrent callers never share state. Otherwise a single service is
     built from ``settings`` and shared.
     """
@@ -70,15 +71,26 @@ def build_server(
 
     @contextmanager
     def acquire(ctx: Context) -> Iterator[LoseItService]:
-        if resolver is None:
-            assert shared is not None
-            yield shared
-            return
-        service, _ = resolve_or_raise(resolver, ctx.headers or {}, registry)
+        """Yield a service for this request, translating failures for the user.
+
+        Wraps the whole tool body so a protocol break inside an RPC surfaces as
+        an explanation rather than a decoder traceback.
+        """
         try:
-            yield service
-        finally:
-            service.close()
+            if resolver is None:
+                assert shared is not None
+                yield shared
+                return
+            service, _ = resolve_or_raise(resolver, ctx.headers or {}, sealer)
+            try:
+                yield service
+            finally:
+                service.close()
+        except Exception as exc:
+            translated = translate(exc)
+            if translated is exc:
+                raise
+            raise translated from exc
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[None]:

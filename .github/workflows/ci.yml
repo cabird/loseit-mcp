@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      # Runs on Linux, which is where this deploys — the file-permission
+      # assertions only take effect here, not on a Windows dev machine.
+      - name: Test
+        run: uv run pytest --cov=loseit_mcp --cov-report=term-missing
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the container image
+        # Proves the image still builds and starts with no credentials
+        # configured, which is how it runs in production.
+        run: docker build -t loseit-mcp:ci .
+
+      - name: Verify it serves and reports healthy
+        run: |
+          docker run -d --name ci-check -p 8000:8000 \
+            -e LOSEIT_CACHE_SECRET=ci-secret loseit-mcp:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/healthz; then
+              echo "healthy"
+              docker rm -f ci-check
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server never became healthy"
+          docker logs ci-check
+          docker rm -f ci-check
+          exit 1

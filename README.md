@@ -93,9 +93,19 @@ loseit-mcp delete <entry_id> -d 2026-07-25
 Add `--dry-run` to either log command to preview the math without writing, and
 `--json` for machine-readable output.
 
+Two more, for hosted deployments:
+
+```console
+loseit-mcp gen-secret                      # a secret for LOSEIT_URL_SECRET
+loseit-mcp enroll https://<host>           # get a credential URL for a client
+```
+
 ## Notes
 
 - Deleting writes a recoverable copy to local trash before the wire call.
+- When Lose It changes their private API, tools return an explanation of what
+  broke and what the operator needs to refresh, rather than a decoder
+  traceback — see `errors.py`.
 - Weights carry no unit over the wire; the number is interpreted in whatever
   unit the account displays (lb or kg).
 - **`saturated_fat_g` is not recorded.** The upstream SDK's payload builder

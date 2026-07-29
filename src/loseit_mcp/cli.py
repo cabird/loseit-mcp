@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, Settings, load_settings
-from .enrollment import EnrollmentRegistry
+from .sealed import UrlSealer
 from .service import LoseItService
 
 
@@ -157,6 +157,43 @@ def build_parser() -> argparse.ArgumentParser:
     weights.add_argument("-e", "--end", help="Last day (YYYY-MM-DD, default: today).")
     weights.add_argument("-n", "--days", type=int, default=30, help="Window size.")
 
+    enroll = sub.add_parser(
+        "enroll",
+        help="Get a credential URL from a hosted server.",
+        description=(
+            "Asks a hosted loseit-mcp server to seal your credentials into a "
+            "URL you can hand to an MCP client. Secrets are read from the "
+            "environment or prompted for — never passed on the command line, "
+            "where they would land in shell history and process listings."
+        ),
+    )
+    enroll.add_argument(
+        "server",
+        help="Base URL of the hosted server, e.g. https://loseit-mcp.azurewebsites.net",
+    )
+    enroll.add_argument("--email", help="Lose It! account email (prompted if omitted).")
+    enroll.add_argument(
+        "--ttl-days",
+        type=int,
+        help="Days before the URL stops working (server default: 365).",
+    )
+    enroll.add_argument(
+        "--tz",
+        type=int,
+        dest="tz_offset",
+        help="Your UTC offset in whole hours, e.g. -7. Defaults to this machine's.",
+    )
+    enroll.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Allow a plain-http server URL. Only for local testing.",
+    )
+
+    sub.add_parser(
+        "gen-secret",
+        help="Print a random secret suitable for LOSEIT_URL_SECRET.",
+    )
+
     delete = sub.add_parser("delete", help="Delete a diary entry.")
     delete.add_argument("entry_id", help="entry_id from the diary command.")
     delete.add_argument("-d", "--date", help="Day the entry is on (default: today).")
@@ -222,60 +259,40 @@ def _print_logged(result: dict[str, Any]) -> None:
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 
-def _build_registry(settings: Settings) -> EnrollmentRegistry | None:
-    """Build the enrollment registry when URL-token auth is enabled."""
+def _build_sealer(settings: Settings) -> UrlSealer | None:
+    """Build the URL sealer when credential URLs are enabled.
+
+    Stateless by design: the secret is the only thing that needs to persist, so
+    there is no store to configure, no volume to mount, and nothing to lose on
+    restart.
+    """
     if os.environ.get("LOSEIT_ENROLLMENT", "").lower() not in ("1", "true", "yes"):
         return None
 
-    from .config import CONFIG_DIR
-    from .enrollment import FileEnrollmentStore
-
-    secret = os.environ.get("LOSEIT_CACHE_SECRET")
+    secret = os.environ.get("LOSEIT_URL_SECRET")
     if not secret:
         raise ConfigError(
-            "LOSEIT_ENROLLMENT requires LOSEIT_CACHE_SECRET. Without a stable "
-            "secret every restart would orphan all issued URLs."
+            "LOSEIT_ENROLLMENT requires LOSEIT_URL_SECRET — it is the key that "
+            "seals and opens credential URLs. Generate one with: "
+            'python -c "import secrets; print(secrets.token_urlsafe(32))"'
         )
     if not os.environ.get("LOSEIT_ENROLL_SECRET"):
         raise ConfigError(
             "LOSEIT_ENROLLMENT requires LOSEIT_ENROLL_SECRET. An open /enroll "
-            "endpoint lets anyone mint records against a shared store. Set it "
-            "and send it as the X-Enroll-Secret header."
+            "endpoint lets anyone mint working credential URLs. Set it and send "
+            "it as the X-Enroll-Secret header."
         )
-    path = Path(os.environ.get("LOSEIT_ENROLLMENT_PATH") or CONFIG_DIR / "enrollments.json")
-    _check_writable(path)
-    registry = EnrollmentRegistry(FileEnrollmentStore(path), secret.encode("utf-8"))
-    registry.purge_expired()
-    return registry
-
-
-def _check_writable(path: Path) -> None:
-    """Fail at startup if the enrollment store can't be written.
-
-    Otherwise the problem only surfaces as a 500 the first time someone tries
-    to enroll — after the container has already reported itself healthy.
-    """
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        probe = path.parent / f".write-probe-{os.getpid()}"
-        probe.touch()
-        probe.unlink()
-    except OSError as exc:
-        raise ConfigError(
-            f"Enrollment store directory {path.parent} is not writable: {exc}. "
-            "Point LOSEIT_ENROLLMENT_PATH at a writable, persistent location "
-            "(a mounted volume, or /home on Azure App Service)."
-        ) from exc
+    return UrlSealer(secret.encode("utf-8"))
 
 
 def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
     import uvicorn
 
     from .server import build_server
-    from .webapp import PathTokenMiddleware, add_enrollment_routes, install_log_redaction
+    from .webapp import PathTokenMiddleware, add_enrollment_route, install_log_redaction
 
     multi_tenant = getattr(args, "multi_tenant", False)
-    registry = _build_registry(settings) if multi_tenant else None
+    sealer = _build_sealer(settings) if multi_tenant else None
 
     # In multi-tenant mode credentials come from each request, so the process
     # itself needs none — and shouldn't be started with any.
@@ -293,19 +310,19 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
         build_server(settings).run("stdio")
         return 0
 
-    mcp = build_server(settings, multi_tenant=multi_tenant, registry=registry)
+    mcp = build_server(settings, multi_tenant=multi_tenant, sealer=sealer)
     _add_health_route(mcp)
-    if registry is not None:
-        add_enrollment_routes(
+    if sealer is not None:
+        add_enrollment_route(
             mcp,
-            registry,
+            sealer,
             mount_path=args.path,
             enroll_secret=os.environ.get("LOSEIT_ENROLL_SECRET"),
         )
 
     mode = "multi-tenant" if multi_tenant else "single-account"
-    if registry is not None:
-        mode += " + enrollment URLs"
+    if sealer is not None:
+        mode += " + credential URLs"
 
     if args.transport == "sse":
         print(f"Serving MCP ({mode}) over SSE at http://{args.host}:{args.port}", file=sys.stderr)
@@ -313,8 +330,7 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
         return 0
 
     app = mcp.streamable_http_app(streamable_http_path=args.path)
-    if registry is not None:
-        # Wrap so /u/<token>{path} resolves to the same MCP mount point.
+    if sealer is not None:
         app = PathTokenMiddleware(app, mount_path=args.path)
 
     print(
@@ -323,18 +339,14 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
         file=sys.stderr,
     )
 
-    if registry is None:
+    if sealer is None:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
         return 0
 
     # Own the logging config so redaction survives: uvicorn's own dictConfig
     # replaces handlers during startup, which would drop filters installed
-    # beforehand. Tokens are decryption keys, so this has to be reliable.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s:     %(message)s",
-        force=True,
-    )
+    # beforehand. Sealed URLs are credentials, so this has to be reliable.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s", force=True)
     install_log_redaction()
     uvicorn.run(app, host=args.host, port=args.port, log_config=None)
     return 0
@@ -448,6 +460,40 @@ def _run_command(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _run_enroll(args: argparse.Namespace) -> int:
+    """Fetch a credential URL from a hosted server and print it."""
+    from .enroll_client import EnrollClientError, enroll
+
+    try:
+        result = enroll(
+            args.server,
+            email=args.email,
+            ttl_days=args.ttl_days,
+            tz_offset=args.tz_offset,
+            allow_insecure=args.insecure,
+        )
+    except EnrollClientError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        _print_json(result)
+        return 0
+
+    print("\nAdd this to your MCP client configuration:\n")
+    print(f"  {result['url']}\n")
+    ttl = result.get("expires_in_days")
+    if ttl:
+        print(f"It stops working in {ttl} days.")
+    print(
+        "Treat this URL as a password: it grants access to your Lose It! "
+        "account.\nIt cannot be revoked individually — if it leaks, the server "
+        "operator must\nrotate LOSEIT_URL_SECRET, which invalidates every "
+        "issued URL."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Windows consoles default to a legacy code page, which mangles em-dashes
     # and any non-ASCII food name (e.g. "Häagen-Dazs").
@@ -464,6 +510,13 @@ def main(argv: list[str] | None = None) -> int:
         settings = _settings_from_args(args)
         if args.command == "serve":
             return _run_serve(args, settings)
+        if args.command == "enroll":
+            return _run_enroll(args)
+        if args.command == "gen-secret":
+            import secrets
+
+            print(secrets.token_urlsafe(32))
+            return 0
         return _run_command(args, settings)
     except (ConfigError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

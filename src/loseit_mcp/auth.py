@@ -110,7 +110,26 @@ def _write_private(path: Path, text: str) -> None:
     if sys.platform == "win32":
         _restrict_windows_acl(tmp)
 
-    os.replace(tmp, path)
+    _replace_with_retry(tmp, path)
+
+
+def _replace_with_retry(src: Path, dst: Path, *, attempts: int = 10) -> None:
+    """``os.replace`` with a short backoff.
+
+    The replace is atomic on POSIX. On Windows it can transiently fail with a
+    sharing violation when another writer (or a virus scanner) holds the
+    destination open, so retry briefly before giving up rather than losing the
+    write.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                src.unlink(missing_ok=True)
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def _restrict_windows_acl(path: Path) -> None:

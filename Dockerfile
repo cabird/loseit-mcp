@@ -38,18 +38,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---- Runtime -------------------------------------------------------------
 FROM python:3.12-slim AS runtime
 
-# Run unprivileged. Azure App Service does not require root, and the app never
-# writes outside its own data directory.
+# Run unprivileged. Azure App Service does not require root, and the app writes
+# nothing to disk — credential URLs are sealed with a secret, not stored.
 RUN groupadd --system --gid 1001 app \
-    && useradd --system --uid 1001 --gid app --create-home app \
-    && mkdir -p /data \
-    && chown app:app /data
+    && useradd --system --uid 1001 --gid app --create-home app
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     LOSEIT_MULTI_TENANT=1 \
-    LOSEIT_ENROLLMENT_PATH=/data/enrollments.json \
     PORT=8000
 
 WORKDIR /app
@@ -58,10 +55,6 @@ COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --from=builder --chown=app:app /app/src /app/src
 
 USER app
-
-# Enrollments must outlive the container. Mount a volume here, or point
-# LOSEIT_ENROLLMENT_PATH at App Service's persistent /home share.
-VOLUME ["/data"]
 
 EXPOSE 8000
 

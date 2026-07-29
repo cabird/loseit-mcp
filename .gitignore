@@ -28,3 +28,6 @@ htmlcov/
 scratch_*.py
 tmp-*.json
 *.tmp
+probe_*.py
+probe_*.json
+

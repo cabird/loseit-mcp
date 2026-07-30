@@ -284,10 +284,11 @@ def _build_sealer(settings: Settings) -> UrlSealer | None:
             "seals and opens credential URLs. Generate one with: "
             "loseit-mcp gen-secret"
         )
-    # LOSEIT_ENROLL_SECRET is optional. Enrolling requires already knowing the
-    # account password and never contacts Lose It, so an open endpoint exposes
-    # nothing; throttling covers the abuse case. Set it to keep an instance
-    # private.
+    # LOSEIT_ENROLL_SECRET is optional. An open endpoint mints URLs only for
+    # accounts whose password the caller already knows, so it grants no access
+    # they didn't already have; per-address and per-email throttling covers the
+    # abuse case, including the guessing that credential verification would
+    # otherwise enable. Set it to keep an instance private.
     return UrlSealer(secret.encode("utf-8"))
 
 
@@ -330,8 +331,9 @@ def _transport_security() -> Any:
 def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
     import uvicorn
 
+    from .enroll import VERIFY_LIMIT, add_enrollment_route, verify_credentials
     from .server import build_server
-    from .webapp import PathTokenMiddleware, add_enrollment_route, install_log_redaction
+    from .webapp import PathTokenMiddleware, install_log_redaction
 
     multi_tenant = getattr(args, "multi_tenant", False)
     sealer = _build_sealer(settings) if multi_tenant else None
@@ -360,6 +362,12 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
             sealer,
             mount_path=args.path,
             enroll_secret=os.environ.get("LOSEIT_ENROLL_SECRET"),
+            # Check the credentials before issuing a URL. Without this, a typo
+            # yields a link that looks fine and fails on every tool call, with
+            # nothing to point at the cause.
+            verify=verify_credentials,
+            verify_limit=limit_from_env("LOSEIT_VERIFY_RATE", VERIFY_LIMIT),
+            serve_page=True,
         )
 
     mode = "multi-tenant" if multi_tenant else "single-account"

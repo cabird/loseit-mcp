@@ -9,10 +9,11 @@ from starlette.testclient import TestClient
 
 from loseit_mcp.cli import _add_health_route
 from loseit_mcp.config import Settings
+from loseit_mcp.enroll import add_enrollment_route
 from loseit_mcp.sealed import UrlSealer
 from loseit_mcp.server import build_server
 from loseit_mcp.throttle import Limit, ThrottleMiddleware
-from loseit_mcp.webapp import PathTokenMiddleware, add_enrollment_route
+from loseit_mcp.webapp import PathTokenMiddleware
 
 SECRET = b"kJ8x2mQ7vN4pL9wR3tY6uZ1aS5dF0gH8cV7bN2mX"
 
@@ -67,11 +68,17 @@ class TestOpenEnrollment:
         sealed = url.split("/u/")[1].split("/")[0]
         assert UrlSealer(SECRET).open(sealed).email == "u@example.com"
 
-    def test_enrolling_never_reveals_whether_credentials_are_real(
+    def test_enrolling_without_verification_reveals_nothing(
         self, client: Any
     ) -> None:
-        """Sealing does not contact Lose It, so /enroll cannot be used to test
-        whether a password is valid — which is what makes an open endpoint safe."""
+        """Without a verifier, sealing never contacts Lose It, so /enroll
+        cannot be used to test whether a password is valid.
+
+        The deployed configuration *does* verify (see ``test_enroll_site.py``),
+        which trades this property for catching typos at enrollment time. That
+        trade is what the per-email throttle pays for; this test pins the
+        behaviour of the unverified mode rather than describing the deployment.
+        """
         good = client.post("/enroll", json={"email": "real@example.com", "password": "pw"})
         junk = client.post("/enroll", json={"email": "fake@example.com", "password": "xx"})
         assert good.status_code == junk.status_code == 201
@@ -116,6 +123,29 @@ class TestEnrollThrottling:
         # A distinct forwarded address gets its own budget.
         other = _enroll(client, headers={"X-Forwarded-For": "198.51.100.77"})
         assert other.status_code == 201
+
+    def test_a_sealed_prefix_does_not_grant_a_fresh_budget(self, client: Any) -> None:
+        """Regression: /u/<anything>/enroll is rewritten to /enroll before the
+        handler runs, so it must be charged to the enrollment budget. Keying on
+        the pre-rewrite path put it in the far larger tool budget instead, and
+        because a fresh segment also minted a fresh credential bucket, the
+        enrollment limit could be bypassed entirely."""
+        junk = "Z" * 40
+        for _ in range(3):
+            _enroll(client)
+        blocked = client.post(
+            f"/u/{junk}/enroll", json={"email": "u@example.com", "password": "pw"}
+        )
+        assert blocked.status_code == 429
+
+    def test_the_prefixed_route_really_does_reach_the_handler(self, client: Any) -> None:
+        """Guards the test above: if the prefixed path 404'd, the assertion
+        there would pass for the wrong reason."""
+        response = client.post(
+            f"/u/{'Z' * 40}/enroll", json={"email": "u@example.com", "password": "pw"}
+        )
+        assert response.status_code == 201
+        assert "/u/" in response.json()["url"]
 
     def test_spoofing_the_header_does_not_grant_a_fresh_budget(
         self, settings: Settings

@@ -37,6 +37,31 @@ class AuthError(RuntimeError):
     """Login failed or no usable credential is available."""
 
 
+class InvalidCredentialsError(AuthError):
+    """Lose It! actively rejected the email/password pair.
+
+    Split out from the generic failure so callers can tell "your password is
+    wrong" apart from "we couldn't reach Lose It". Reporting the latter as the
+    former would tell a user to change a password that was fine all along.
+    """
+
+
+class UpstreamUnavailableError(AuthError):
+    """Lose It! could not be reached, or answered in a way we can't use.
+
+    Nothing is known about the credentials in this case — in particular, this
+    must never be presented as a rejection.
+    """
+
+
+# OAuth 2.0 error codes that mean "these credentials are no good", as opposed
+# to a transport or server problem. Lose It returns `invalid_grant` for both a
+# wrong password and an unknown account.
+_CREDENTIAL_REJECTIONS = frozenset(
+    {"invalid_grant", "invalid_client", "unauthorized_client", "access_denied"}
+)
+
+
 @dataclass(frozen=True)
 class Session:
     """A resolved, usable Lose It! session."""
@@ -189,17 +214,10 @@ def login(email: str, password: str, *, timeout: float = 30.0) -> Session:
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             resp = client.post(LOGIN_URL, data=body, headers=headers)
     except httpx.HTTPError as exc:
-        raise AuthError(f"Could not reach the Lose It! login endpoint: {exc}") from exc
+        raise UpstreamUnavailableError(
+            f"Could not reach the Lose It! login endpoint: {exc}"
+        ) from exc
 
-    if resp.status_code in (400, 401, 403):
-        raise AuthError(
-            f"Lose It! rejected the credentials (HTTP {resp.status_code}). "
-            "Check LOSEIT_EMAIL / LOSEIT_PASSWORD."
-        )
-    if resp.status_code != 200:
-        raise AuthError(f"Login failed: HTTP {resp.status_code}: {resp.text[:300]}")
-
-    token = resp.cookies.get("liauth") or resp.cookies.get("fn_auth")
     payload: dict[str, Any] = {}
     try:
         parsed = resp.json()
@@ -208,6 +226,22 @@ def login(email: str, password: str, *, timeout: float = 30.0) -> Session:
     except ValueError:
         payload = {}
 
+    # Lose It answers a bad email *or* a bad password with HTTP 404 and an
+    # OAuth-style `invalid_grant` body — not the 401 you would expect. Reading
+    # only the status would file every rejection under "the server is broken",
+    # so the body is what decides. (Both cases are byte-identical, so this
+    # cannot be used to discover whether an account exists.)
+    oauth_error = payload.get("error") if isinstance(payload.get("error"), str) else None
+    if resp.status_code in (400, 401, 403) or oauth_error in _CREDENTIAL_REJECTIONS:
+        raise InvalidCredentialsError(
+            f"Lose It! rejected the credentials (HTTP {resp.status_code}"
+            f"{f', {oauth_error}' if oauth_error else ''}). "
+            "Check the email and password."
+        )
+    if resp.status_code != 200:
+        raise UpstreamUnavailableError(f"Login failed: HTTP {resp.status_code}: {resp.text[:300]}")
+
+    token = resp.cookies.get("liauth") or resp.cookies.get("fn_auth")
     # Some builds return the JWT in the body rather than as a cookie.
     if not token:
         for key in ("access_token", "token", "liauth", "jwt"):
@@ -217,7 +251,7 @@ def login(email: str, password: str, *, timeout: float = 30.0) -> Session:
                 break
 
     if not token:
-        raise AuthError(
+        raise UpstreamUnavailableError(
             "Login succeeded but no 'liauth' token was returned. "
             f"Cookies: {sorted(resp.cookies.keys())}; body keys: {sorted(payload)}"
         )

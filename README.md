@@ -100,6 +100,17 @@ loseit-mcp gen-secret                      # a secret for LOSEIT_URL_SECRET
 loseit-mcp enroll https://<host>           # get a credential URL for a client
 ```
 
+A hosted deployment also serves a self-service enrollment page at `/`: someone
+enters their Lose It! email and password and gets their own MCP URL back, ready
+to paste into Claude, ChatGPT, or any other MCP client. Credentials are checked
+against Lose It before a URL is issued, so a typo fails immediately instead of
+producing a link that silently doesn't work.
+
+The page is a single self-contained document under a strict CSP — no external
+scripts, styles, or fonts — so nothing but Lose It ever sees the credentials.
+Nothing is stored: the password is used once, in memory, and then encrypted
+into the URL itself, which is why there is no database and no account system.
+
 ## Notes
 
 - Deleting writes a recoverable copy to local trash before the wire call.
@@ -107,7 +118,9 @@ loseit-mcp enroll https://<host>           # get a credential URL for a client
   broke and what the operator needs to refresh, rather than a decoder
   traceback — see `errors.py`.
 - Hosted deployments rate-limit per client address *and* per credential, since
-  an address alone is a weak identity behind a NAT pool.
+  an address alone is a weak identity behind a NAT pool. Enrollment adds a
+  third limit, per email address, so verifying credentials can't be used to
+  guess them.
 - `/healthz` reports the running version and commit, so you can tell what is
   actually deployed without reading logs.
 - Weights carry no unit over the wire; the number is interpreted in whatever

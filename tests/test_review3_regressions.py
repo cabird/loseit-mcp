@@ -11,6 +11,13 @@ import pytest
 from starlette.testclient import TestClient
 
 from loseit_mcp.config import Settings
+from loseit_mcp.enroll import (
+    MAX_EMAIL_LENGTH,
+    MAX_PASSWORD_LENGTH,
+    MAX_TTL_DAYS,
+    add_enrollment_route,
+)
+from loseit_mcp.paths import TOKEN_REDACT_RE
 from loseit_mcp.sealed import (
     MIN_SECRET_LENGTH,
     SealError,
@@ -18,12 +25,7 @@ from loseit_mcp.sealed import (
 )
 from loseit_mcp.server import build_server
 from loseit_mcp.webapp import (
-    _TOKEN_SUB_RE,
-    MAX_EMAIL_LENGTH,
-    MAX_PASSWORD_LENGTH,
-    MAX_TTL_DAYS,
     PathTokenMiddleware,
-    add_enrollment_route,
 )
 
 GOOD_SECRET = b"kJ8x2mQ7vN4pL9wR3tY6uZ1aS5dF0gH8cV7bN2mX"
@@ -146,7 +148,7 @@ class TestRedactionIsUnbounded:
     @pytest.mark.parametrize("length", [32, 200, 2048, 2049, 4096])
     def test_segments_of_any_length_are_fully_redacted(self, length: int) -> None:
         segment = "A" * length
-        redacted = _TOKEN_SUB_RE.sub(r"\1<redacted>", f'"POST /u/{segment}/mcp HTTP/1.1" 200')
+        redacted = TOKEN_REDACT_RE.sub(r"\1<redacted>", f'"POST /u/{segment}/mcp HTTP/1.1" 200')
         assert segment not in redacted
         assert "A" * 32 not in redacted, "no fragment of the segment may survive"
 
@@ -164,12 +166,36 @@ class TestEnrollSecretComparison:
         assert client.post("/enroll", json={"email": "u@example.com", "password": "pw"}).status_code == 403
 
     def test_comparison_is_constant_time(self) -> None:
-        """Guards against reintroducing a short-circuiting `!=`."""
-        import inspect
+        """Guards against reintroducing a short-circuiting `!=`.
 
-        from loseit_mcp import webapp
+        Asserting on behaviour rather than on source text: the previous version
+        of this test grepped the function for "compare_digest", which would
+        have passed just as happily against a broken comparison somewhere else
+        in the file.
+        """
+        from loseit_mcp.enroll import _secret_matches
 
-        assert "compare_digest" in inspect.getsource(webapp.add_enrollment_route)
+        assert _secret_matches("s3cret", "s3cret")
+        assert not _secret_matches("s3crey", "s3cret")
+        assert not _secret_matches("", "s3cret")
+        assert not _secret_matches(None, "s3cret")
+        # Differing lengths must be refused, not raise.
+        assert not _secret_matches("s3cret-and-then-some", "s3cret")
+
+    def test_a_non_ascii_secret_is_refused_rather_than_crashing(self, client: Any) -> None:
+        """`hmac.compare_digest` raises TypeError on non-ASCII str, which would
+        turn a wrong guess into a 500.
+
+        Sent as raw bytes because that is how it arrives on the wire: Starlette
+        decodes header bytes as latin-1, so a non-ASCII value reaches the
+        handler as a str that `compare_digest` refuses to look at.
+        """
+        response = client.post(
+            "/enroll",
+            json={"email": "u@example.com", "password": "pw"},
+            headers={"X-Enroll-Secret": "sécret".encode("latin-1")},
+        )
+        assert response.status_code == 403
 
 
 class TestRotationMessage:

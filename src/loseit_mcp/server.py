@@ -21,6 +21,7 @@ from typing import Annotated, Any
 from mcp.server.mcpserver import Context, MCPServer
 from pydantic import Field
 
+from . import __version__
 from .config import Settings
 from .errors import translate
 from .sealed import UrlSealer
@@ -102,7 +103,7 @@ def build_server(
 
     mcp = MCPServer(
         name="loseit",
-        version="0.1.0",
+        version=__version__,
         instructions=INSTRUCTIONS,
         lifespan=lifespan,
     )
@@ -295,7 +296,8 @@ def build_server(
     @mcp.tool(
         description=(
             "Read recorded weigh-ins over a date range, with min/max/change "
-            "summary. Defaults to the last 30 days."
+            "summary. Defaults to the last 30 days. A single call may span at "
+            "most about 10 years; ask for a wider history in several calls."
         )
     )
     def get_weight_history(

@@ -22,12 +22,13 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
-import re
 import threading
 import time
 from dataclasses import dataclass
 
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from .paths import split_token_path
 
 
 @dataclass(frozen=True)
@@ -132,12 +133,18 @@ def client_key(scope: Scope, trusted_proxies: int = 1) -> str:
     across a NAT pool gets one budget per address. That is why authenticated
     traffic is *also* throttled per credential (see
     :func:`credential_key`), which no amount of address rotation affects.
+
+    ``trusted_proxies=0`` means nothing sits in front of us, so the header is
+    entirely client-supplied and is ignored outright.
     """
     headers = dict(scope.get("headers") or [])
     forwarded = headers.get(b"x-forwarded-for", b"").decode("latin-1")
-    if forwarded:
+    if forwarded and trusted_proxies > 0:
         hops = [h.strip() for h in forwarded.split(",") if h.strip()]
         if hops:
+            # Clamp: a header with fewer hops than we expect proxies means the
+            # request did not arrive the way we assumed, so fall back to the
+            # leftmost entry rather than reading off the end of the list.
             index = max(0, len(hops) - trusted_proxies)
             candidate = _strip_port(hops[index])
             if candidate:
@@ -176,10 +183,9 @@ def credential_key(scope: Scope) -> str | None:
     in the bucket store. Sealed URLs and credential headers are distinguished by
     prefix so they can't collide.
     """
-    path = scope.get("path", "")
-    match = _TOKEN_PATH_RE.match(path)
-    if match:
-        return "u:" + hashlib.sha256(match.group(1).encode("ascii")).hexdigest()[:32]
+    token, _ = split_token_path(scope.get("path", ""))
+    if token is not None:
+        return "u:" + hashlib.sha256(token.encode("ascii")).hexdigest()[:32]
 
     headers = dict(scope.get("headers") or [])
     for name in (b"authorization", b"x-loseit-password"):
@@ -187,11 +193,6 @@ def credential_key(scope: Scope) -> str | None:
         if value:
             return "h:" + hashlib.sha256(value).hexdigest()[:32]
     return None
-
-
-# Matches the sealed segment in /u/<sealed>/... so the credential can be keyed
-# on before any routing or decryption happens.
-_TOKEN_PATH_RE = re.compile(r"^/u/([A-Za-z0-9_-]{32,})")
 
 
 class ThrottleMiddleware:
@@ -225,6 +226,7 @@ class ThrottleMiddleware:
         self._exempt = exempt_paths
 
     def _address_throttle(self, path: str) -> Throttle | None:
+        """Pick the address bucket for an *effective* (post-rewrite) path."""
         if path in self._exempt:
             return None
         if path == "/enroll":
@@ -236,8 +238,13 @@ class ThrottleMiddleware:
             await self._app(scope, receive, send)
             return
 
-        path = scope.get("path", "")
-        by_address = self._address_throttle(path)
+        # Classify on the path routing will actually see, not the one on the
+        # wire. This middleware runs ahead of the rewrite, so /u/<sealed>/enroll
+        # still reaches the enrollment handler; charging it by its raw path
+        # would put it in the far larger tool budget and make the enrollment
+        # limit trivially bypassable.
+        _, effective_path = split_token_path(scope.get("path", ""))
+        by_address = self._address_throttle(effective_path)
         if by_address is None:
             await self._app(scope, receive, send)
             return

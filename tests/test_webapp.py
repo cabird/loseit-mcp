@@ -9,6 +9,7 @@ import pytest
 
 from loseit_mcp.auth import Session
 from loseit_mcp.config import Settings
+from loseit_mcp.paths import TOKEN_PATH_RE
 from loseit_mcp.sealed import UrlSealer
 from loseit_mcp.tenancy import (
     Credentials,
@@ -19,7 +20,6 @@ from loseit_mcp.tenancy import (
 )
 from loseit_mcp.tokencache import TokenCache
 from loseit_mcp.webapp import (
-    _TOKEN_RE,
     _path_token,
     _RedactTokenFilter,
     current_path_token,
@@ -39,7 +39,7 @@ class TestPathMatching:
         ],
     )
     def test_matches_token_paths(self, path: str, expected_remainder: str | None) -> None:
-        match = _TOKEN_RE.match(path)
+        match = TOKEN_PATH_RE.match(path)
         assert match is not None
         assert match.group(1) == TOKEN
         assert match.group(2) == expected_remainder
@@ -49,7 +49,7 @@ class TestPathMatching:
         ["/mcp", "/healthz", "/enroll", "/u/", "/u/short", "/uu/" + TOKEN, "/x/u/" + TOKEN],
     )
     def test_ignores_everything_else(self, path: str) -> None:
-        assert _TOKEN_RE.match(path) is None
+        assert TOKEN_PATH_RE.match(path) is None
 
 
 class TestLogRedaction:

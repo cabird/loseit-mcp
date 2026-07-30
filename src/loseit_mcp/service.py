@@ -11,7 +11,8 @@ from __future__ import annotations
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Self, TypeVar
 
@@ -86,6 +87,13 @@ def _is_auth_failure(exc: Exception) -> bool:
     return False
 
 
+# The widest weight-history range a single call may request. Lose It! launched
+# in 2008, so ten years comfortably covers any real account while keeping the
+# worst-case fan-out to roughly seventy upstream requests instead of sixty
+# thousand.
+MAX_HISTORY_SPAN_DAYS = 3660
+
+
 # The GWT string table ships non-ASCII and quote characters as literal
 # ``\uXXXX`` escapes, and the upstream decoder passes them through verbatim —
 # so food names arrive looking like ``Mike\u0027s``. Undo that here.
@@ -132,9 +140,10 @@ class LoseItService:
     """A logged-in Lose It! client with auto-refreshing credentials.
 
     Instances are safe to share across threads: lifecycle transitions (first
-    login, re-authentication, shutdown) are serialized by a lock, so a
-    re-auth triggered by one caller cannot close a client another caller is
-    mid-request on.
+    login, re-authentication, shutdown) are serialized by a lock, and a client
+    superseded by re-authentication is closed only once no request is still
+    using it — so a re-auth triggered by one caller cannot close a client
+    another caller is mid-request on.
     """
 
     def __init__(self, settings: Settings):
@@ -142,6 +151,11 @@ class LoseItService:
         self._session: Session | None = None
         self._client: LoseIt | None = None
         self._lock = threading.RLock()
+        # Requests run outside the lock, so a re-auth can land while another
+        # thread is still using the previous client. Superseded clients are
+        # parked here and closed once nothing is using them.
+        self._inflight = 0
+        self._retired: list[LoseIt] = []
         # Optional hook so a caller-managed cache can be refreshed when we mint
         # a new session behind its back. Set by the multi-tenant resolver.
         self.on_reauthenticated: Callable[[Session], None] | None = None
@@ -177,38 +191,83 @@ class LoseItService:
     def _reauthenticate(self) -> None:
         """Force a fresh login and rebuild the underlying client."""
         with self._lock:
-            self.close()
+            # Retire rather than close: another thread may be issuing a request
+            # through this client right now, and closing its connection pool
+            # would fail that request with a confusing transport error.
+            if self._client is not None:
+                self._retired.append(self._client)
+                self._client = None
             # Clear first: if the login below fails, we must not leave the
             # rejected session in place for the next call to rebuild from.
             self._session = None
             session = resolve_session(self._settings, force_login=True)
             self._session = session
             self._client = self._build_client(session)
+            reclaimed = self._reclaim_retired()
+
+        for client in reclaimed:
+            client.close()
 
         if self.on_reauthenticated is not None:
             # Outside the lock: the callback belongs to the caller and must not
             # be able to deadlock this service.
             self.on_reauthenticated(session)
 
+    def _reclaim_retired(self) -> list[LoseIt]:
+        """Take ownership of retired clients that are safe to close.
+
+        Caller must hold the lock, and must close the returned clients *after*
+        releasing it.
+        """
+        if self._inflight > 0 or not self._retired:
+            return []
+        retired, self._retired = self._retired, []
+        return retired
+
+    @contextmanager
+    def _in_flight(self) -> Iterator[None]:
+        """Mark a request as active so no client is closed underneath it."""
+        with self._lock:
+            self._inflight += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._inflight -= 1
+                reclaimed = self._reclaim_retired()
+            for client in reclaimed:
+                client.close()
+
     def _retrying(self, fn: Callable[[], _T]) -> _T:
         """Run ``fn``, retrying once after re-authenticating on auth failure."""
         try:
-            return fn()
+            with self._in_flight():
+                return fn()
         except Exception as exc:
             if not _is_auth_failure(exc):
                 raise
             self._reauthenticate()
-            return fn()
+            with self._in_flight():
+                return fn()
 
     def _call(self, fn_name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke an SDK method, retrying once after a re-login on auth failure."""
         return self._retrying(lambda: getattr(self.client, fn_name)(*args, **kwargs))
 
     def close(self) -> None:
+        """Shut down, releasing every client this service has built.
+
+        Unlike re-authentication this is an explicit teardown, so retired
+        clients are closed even if a request is somehow still in flight.
+        """
         with self._lock:
+            pending = self._retired
+            self._retired = []
             if self._client is not None:
-                self._client.close()
+                pending.append(self._client)
                 self._client = None
+        for client in pending:
+            client.close()
 
     # ── Dates ───────────────────────────────────────────────────────────
 
@@ -451,9 +510,31 @@ class LoseItService:
 
         Defaults to the last ``days`` days ending today. Explicit ``start`` /
         ``end`` override that.
+
+        The span is capped. Cost here is not proportional to the number of
+        *results* but to the number of days asked for: the range is fetched in
+        windows of about seven weeks, so an open-ended ``start`` turns one tool
+        call into tens of thousands of upstream requests. Those all run inside a
+        single request, where no rate limiter gets another say, so the bound has
+        to live here.
         """
         end_date = self._day(end)
         start_date = self._parse(start) or (end_date - timedelta(days=max(days, 1) - 1))
+
+        if end_date < start_date:
+            raise ValueError(
+                f"start {start_date.isoformat()} is after end {end_date.isoformat()}."
+            )
+
+        span = (end_date - start_date).days + 1
+        if span > MAX_HISTORY_SPAN_DAYS:
+            raise ValueError(
+                f"Requested {span:,} days of weight history "
+                f"({start_date.isoformat()} to {end_date.isoformat()}); the maximum "
+                f"is {MAX_HISTORY_SPAN_DAYS:,} (about "
+                f"{MAX_HISTORY_SPAN_DAYS // 365} years). Narrow start/end and, if "
+                "you need more, request it in several ranges."
+            )
 
         entries = self._retrying(
             lambda: _get_weight_history(self.client.http, start_date, end_date)

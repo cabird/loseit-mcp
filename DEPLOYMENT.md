@@ -76,13 +76,57 @@ curl -X POST https://<host>/enroll \
 
 Nothing is stored to produce the URL.
 
-#### Enrollment is open by default
+#### The enrollment page
 
-Anyone can enroll, because being able to enroll grants nothing: you must
-already know the account password, and sealing never contacts Lose It — the
-server encrypts whatever it is handed and returns 201 regardless. That last
-property is what makes an open endpoint safe: **`/enroll` is not a password
-oracle**, so it cannot be used to test credentials against Lose It.
+`GET /` serves a self-service page where someone enters their Lose It! email
+and password and gets their MCP URL back. It is a single self-contained
+document — no external stylesheets, fonts, or scripts. That is a privacy
+property rather than a style preference: a third-party asset here would hand a
+CDN a request log tied to a person about to type their password.
+
+It is served under a strict CSP (`default-src 'none'`), which forbids remote
+loading outright so a later edit cannot quietly reintroduce it. Two directives
+are load-bearing and easy to get wrong:
+
+- `connect-src 'self'` — the form submits with `fetch()`. Without it the
+  browser blocks the request and the page silently does nothing.
+- `form-action 'none'` — the form must never fall back to a native navigation,
+  which would put the password in the URL and therefore in every access log
+  between the browser and here.
+
+A nonce whitelists `<style>` elements but *not* `style="..."` attributes, so
+the page carries none; adding one gets it silently dropped.
+
+#### Enrollment is open, and credentials are checked
+
+Anyone can enroll, because being able to enroll grants nothing: a sealed URL is
+worthless without a working Lose It! account, so minting one gives the caller
+no access they didn't already have.
+
+Credentials **are** verified before a URL is issued. Skipping that check makes
+for a genuinely baffling failure — the link looks fine and every tool call
+fails, with nothing pointing at the typo that caused it.
+
+The cost of verifying is that `/enroll` reports whether a password is valid.
+That is mitigated, not ignored:
+
+| Bucket | Default | Why |
+| --- | --- | --- |
+| per email address | 8 per 15 min | A targeted guesser rotates source addresses far more easily than the one account they care about, so this is the bucket that matters. |
+| per client address | 5 per hour | Catches untargeted spraying across many accounts. |
+
+The budget is spent *before* Lose It is contacted, so a throttled attempt never
+reaches upstream. With both limits in place, guessing here is slower than
+guessing against Lose It's own public login form — so this adds no capability
+an attacker did not already have. Override the first with `LOSEIT_VERIFY_RATE`.
+
+Lose It answers a bad email *or* a bad password with HTTP 404 and an
+OAuth-style `invalid_grant` body — not the 401 you would expect — so the body,
+not the status, decides whether a rejection is reported. Both cases are
+byte-identical upstream, so enrollment cannot be used to discover whether an
+account exists. A failure to *reach* Lose It is reported as 502, never as a
+rejection: telling someone their password is wrong during an outage sends them
+off to reset a password that was fine.
 
 Set `LOSEIT_ENROLL_SECRET` to lock an instance down anyway; clients then send
 it as an `X-Enroll-Secret` header. That is a reasonable choice for a private
@@ -139,6 +183,7 @@ must allow the request.
 | Scope | Key | Default |
 | --- | --- | --- |
 | `/enroll` | address | 5 per hour |
+| `/enroll` | email address | 8 per 15 minutes |
 | tool calls | address | 120 per minute |
 | tool calls | credential | 200 per minute |
 | `/healthz` | — | exempt |
@@ -165,6 +210,13 @@ to right — so the **rightmost** entries were added by infrastructure we contro
 and the leftmost is whatever the client claimed. Reading the leftmost would let
 anyone mint unlimited budget by sending a header, so the server counts back from
 the right by `LOSEIT_TRUSTED_PROXIES` (default 1, correct for App Service).
+Setting it to `0` means nothing is in front of the app, so the header is
+entirely client-supplied and is ignored in favour of the socket address.
+
+Throttling is applied to the path *after* sealed-URL rewriting, so
+`/u/<sealed>/enroll` is charged the enrollment budget rather than the much
+larger tool budget. This matters: the two layers previously disagreed, which
+made the enrollment limit bypassable.
 
 State is in memory and bounded to 10,000 tracked clients per bucket, evicting
 idle entries first, so the throttle cannot itself be used to exhaust memory.
@@ -247,8 +299,9 @@ grow it without limit, and evicts expired entries first.
 - **The server sees plaintext passwords.** Unavoidable given Lose It's API, but
   it means the operator is fully trusted. TLS is mandatory, not optional.
 - **No per-URL revocation** (above).
-- **No rate limiting.** A public deployment should sit behind a gateway that
-  provides it, both to protect the instance and to avoid hammering Lose It.
+- **Throttling is not a DDoS defence.** It protects a small instance from
+  casual abuse and keeps us from hammering Lose It; genuinely hostile load
+  belongs behind a gateway.
 - **Single instance assumed.** Scaling out works — the sealer is stateless — but
   each instance keeps its own session cache and authenticates independently.
 
@@ -493,6 +546,7 @@ With a credential URL (no headers needed):
 | `LOSEIT_URL_SECRET` | — | Seals/opens credential URLs. **Required** for enrollment |
 | `LOSEIT_ENROLL_SECRET` | unset | Optional. Restricts `/enroll` to holders of this value |
 | `LOSEIT_ENROLL_RATE` | `5/3600` | `/enroll` budget per address, as `capacity/seconds` |
+| `LOSEIT_VERIFY_RATE` | `8/900` | Sign-in attempts per email address during enrollment |
 | `LOSEIT_MCP_RATE` | `120/60` | Tool-call budget per address |
 | `LOSEIT_CREDENTIAL_RATE` | `200/60` | Tool-call budget per credential |
 | `LOSEIT_TRUSTED_PROXIES` | `1` | Proxies in front of the app, for client-IP resolution |

@@ -13,10 +13,11 @@ from lose_it.core._http import LoseItError
 from starlette.testclient import TestClient
 
 from loseit_mcp.config import Settings
+from loseit_mcp.enroll import add_enrollment_route
 from loseit_mcp.errors import LoseItMcpError, translate
 from loseit_mcp.sealed import UrlSealer
 from loseit_mcp.server import build_server
-from loseit_mcp.webapp import PathTokenMiddleware, add_enrollment_route
+from loseit_mcp.webapp import PathTokenMiddleware
 from loseit_mcp.weight import WeightHistoryError
 
 EXPECTED_TOOLS = {

@@ -289,7 +289,28 @@ def _build_sealer(settings: Settings) -> UrlSealer | None:
     # they didn't already have; per-address and per-email throttling covers the
     # abuse case, including the guessing that credential verification would
     # otherwise enable. Set it to keep an instance private.
-    return UrlSealer(secret.encode("utf-8"))
+    return UrlSealer(secret.encode("utf-8"), enroll_url=_public_enroll_url())
+
+
+def _public_enroll_url() -> str | None:
+    """Where users should go to get a replacement URL, if we can tell.
+
+    A URL that has expired or been invalidated by a secret rotation is most
+    likely held by someone who enrolled through the web page and has never
+    installed the CLI, so the error needs to name a place they can actually go.
+
+    App Service sets ``WEBSITE_HOSTNAME`` for us; ``LOSEIT_PUBLIC_URL`` overrides
+    it for anywhere that doesn't. Returning ``None`` simply falls back to
+    generic wording — this is a nicety, not something to fail startup over.
+    """
+    configured = os.environ.get("LOSEIT_PUBLIC_URL")
+    if configured:
+        return configured.rstrip("/") + "/"
+
+    hostname = os.environ.get("WEBSITE_HOSTNAME")
+    if hostname:
+        return f"https://{hostname.strip().rstrip('/')}/"
+    return None
 
 
 def _transport_security() -> Any:

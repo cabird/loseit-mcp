@@ -552,6 +552,7 @@ With a credential URL (no headers needed):
 | `LOSEIT_TRUSTED_PROXIES` | `1` | Proxies in front of the app, for client-IP resolution |
 | `LOSEIT_CACHE_SECRET` | random per process | Session-cache key material |
 | `LOSEIT_ALLOWED_HOSTS` | `WEBSITE_HOSTNAME`, else localhost | Comma-separated hostnames the MCP endpoint will answer on |
+| `LOSEIT_PUBLIC_URL` | derived from `WEBSITE_HOSTNAME` | Where to send users whose URL expired; only affects that error message |
 | `PORT` | `8000` | Listen port |
 | `LOSEIT_HOURS_FROM_GMT` | auto-detected | Default account UTC offset |
 | `LOSEIT_STRONG_NAME` | current build | GWT permutation, if Lose It redeploys |

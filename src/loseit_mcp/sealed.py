@@ -52,15 +52,32 @@ MIN_SECRET_DISTINCT_CHARS = 12
 # used to distinguish "wrong secret" from "expired" from "tampered". Rotation
 # and expiry are by far the likeliest causes in practice, and the remedy is the
 # same for all of them, so the message says what to do rather than what broke.
-_INVALID_MESSAGE = (
-    "This credential URL is no longer valid. The most likely reasons are that "
-    "the server's URL secret was rotated or that the link expired.\n\n"
-    "Tell the user their saved Lose It! URL has stopped working and they need a "
-    "new one: run `loseit-mcp enroll <server-url>` and enter their Lose It! "
-    "email and password, then replace the URL in their MCP client "
-    "configuration. Nothing is wrong with their Lose It! account, and retrying "
-    "the current URL will not help."
-)
+#
+# The remedy is deployment-specific: someone who enrolled through the web page
+# has never installed the CLI, and telling them to run it sends them nowhere.
+# The hostname is therefore injected by the caller rather than hardcoded, which
+# also keeps any particular deployment's address out of this source file.
+def _invalid_message(enroll_url: str | None) -> str:
+    if enroll_url:
+        remedy = (
+            f"new one: go to {enroll_url} and sign in with their Lose It! email "
+            "and password to get a fresh URL, then replace the URL in their MCP "
+            "client configuration."
+        )
+    else:
+        remedy = (
+            "new one: visit this server's enrollment page, or run "
+            "`loseit-mcp enroll <server-url>`, and enter their Lose It! email "
+            "and password, then replace the URL in their MCP client "
+            "configuration."
+        )
+    return (
+        "This credential URL is no longer valid. The most likely reasons are "
+        "that the server's URL secret was rotated or that the link expired.\n\n"
+        "Tell the user their saved Lose It! URL has stopped working and they "
+        f"need a {remedy} Nothing is wrong with their Lose It! account, and "
+        "retrying the current URL will not help."
+    )
 
 
 class SealError(RuntimeError):
@@ -118,7 +135,7 @@ class UrlSealer:
     same URLs, so this also works unchanged if the app is ever scaled out.
     """
 
-    def __init__(self, secret: bytes):
+    def __init__(self, secret: bytes, *, enroll_url: str | None = None):
         _check_secret_strength(secret)
         # A fixed salt is correct here *given the strength check above*: the
         # secret is high-entropy, and a random salt would have to be stored
@@ -126,6 +143,7 @@ class UrlSealer:
         self._key = HKDF(
             algorithm=hashes.SHA256(), length=32, salt=None, info=_KEY_INFO
         ).derive(secret)
+        self._invalid_message = _invalid_message(enroll_url)
 
     def seal(
         self,
@@ -174,11 +192,11 @@ class UrlSealer:
             if not isinstance(email, str) or not isinstance(password, str):
                 raise TypeError("bad payload")
         except Exception as exc:
-            raise SealError(_INVALID_MESSAGE) from exc
+            raise SealError(self._invalid_message) from exc
 
         expires_at = data.get("x")
         if isinstance(expires_at, int | float) and time.time() >= expires_at:
-            raise SealError(_INVALID_MESSAGE)
+            raise SealError(self._invalid_message)
 
         tz = data.get("tz")
         return SealedCredentials(

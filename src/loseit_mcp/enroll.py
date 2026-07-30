@@ -100,7 +100,7 @@ def add_enrollment_route(
         async def enrollment_page(request: Request) -> Response:
             nonce = secrets.token_urlsafe(16)
             return Response(
-                enrollpage.render(nonce, DEFAULT_TTL_DAYS),
+                enrollpage.render(nonce),
                 media_type="text/html; charset=utf-8",
                 headers={
                     "content-security-policy": CONTENT_SECURITY_POLICY.format(nonce=nonce),

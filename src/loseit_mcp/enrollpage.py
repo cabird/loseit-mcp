@@ -151,11 +151,6 @@ PAGE = """<!doctype html>
       <details>
         <summary>Options</summary>
         <div class="field">
-          <label for="ttl">Link expires after (days)</label>
-          <input id="ttl" name="ttl_days" type="number" min="1" max="3650" value="{default_ttl}">
-          <p class="hint">A shorter life limits the damage if the link leaks.</p>
-        </div>
-        <div class="field">
           <label for="tz">UTC offset in hours</label>
           <input id="tz" name="hours_from_gmt" type="number" min="-12" max="14"
                  placeholder="detected automatically">
@@ -262,8 +257,6 @@ PAGE = """<!doctype html>
     }}
 
     var body = {{ email: email, password: password }};
-    var ttl = numeric('ttl');
-    if (ttl !== null) body.ttl_days = ttl;
     var tz = numeric('tz');
     if (tz !== null) body.hours_from_gmt = tz;
 
@@ -334,6 +327,6 @@ PAGE = """<!doctype html>
 """
 
 
-def render(nonce: str, default_ttl: int) -> str:
+def render(nonce: str) -> str:
     """Render the page for one request."""
-    return PAGE.format(nonce=nonce, default_ttl=default_ttl)
+    return PAGE.format(nonce=nonce)

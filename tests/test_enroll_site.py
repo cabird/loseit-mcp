@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from unittest import mock
 
 import pytest
 from starlette.testclient import TestClient
@@ -17,7 +18,7 @@ from starlette.testclient import TestClient
 from loseit_mcp.auth import InvalidCredentialsError, UpstreamUnavailableError
 from loseit_mcp.config import Settings
 from loseit_mcp.enroll import add_enrollment_route
-from loseit_mcp.sealed import UrlSealer
+from loseit_mcp.sealed import SealError, UrlSealer
 from loseit_mcp.server import build_server
 from loseit_mcp.throttle import Limit, ThrottleMiddleware
 from loseit_mcp.webapp import PathTokenMiddleware, install_log_redaction
@@ -271,6 +272,135 @@ class TestEnrollmentPage:
     def test_the_page_is_absent_when_not_requested(self, settings: Settings) -> None:
         with TestClient(_app(settings, serve_page=False)) as client:
             assert client.get("/").status_code == 404
+
+
+class TestExpiryIsNotAUserDecision:
+    """The page no longer asks people how long their link should live.
+
+    It is a question a normal person has no basis to answer, and the real
+    revocation story is changing the Lose It! password, which invalidates every
+    link immediately. The expiry stays in the payload as a backstop, and stays
+    settable through the API for anyone who wants it.
+    """
+
+    @pytest.fixture
+    def client(self, settings: Settings) -> Any:
+        with TestClient(_app(settings)) as c:
+            yield c
+
+    def test_the_page_does_not_ask_for_a_lifetime(self, client: Any) -> None:
+        body = client.get("/").text
+        assert "ttl_days" not in body
+        assert "expires after" not in body
+
+    def test_the_page_still_says_the_link_expires(self, client: Any) -> None:
+        """Dropping the control must not drop the disclosure."""
+        assert "It expires in" in client.get("/").text
+
+    def test_enrolling_without_a_lifetime_gets_the_default(self, client: Any) -> None:
+        from loseit_mcp.sealed import DEFAULT_TTL_DAYS
+
+        assert _enroll(client).json()["expires_in_days"] == DEFAULT_TTL_DAYS
+
+    def test_the_api_still_accepts_an_explicit_lifetime(self, client: Any) -> None:
+        assert _enroll(client, ttl_days=7).json()["expires_in_days"] == 7
+
+
+class TestExpiredUrlRemedy:
+    """An expired link is most likely held by someone who enrolled on the web
+    and has never installed the CLI, so the error has to name somewhere they
+    can actually go."""
+
+    def test_the_message_names_the_enrollment_page(self) -> None:
+        sealer = UrlSealer(SECRET, enroll_url="https://example.invalid/")
+        stale = UrlSealer(b"pQ3zX8vB2nM6kL0jH4gF7dS1aW5eR9tYcJ4kP8nZ").seal(EMAIL, PASSWORD)
+        with pytest.raises(SealError) as caught:
+            sealer.open(stale)
+        message = str(caught.value)
+        assert "https://example.invalid/" in message
+        assert "loseit-mcp enroll" not in message, "sent a web user to a CLI they don't have"
+
+    def test_an_expired_url_gets_the_same_remedy(self) -> None:
+        sealer = UrlSealer(SECRET, enroll_url="https://example.invalid/")
+        expired = sealer.seal(EMAIL, PASSWORD, ttl_days=None)
+        # Seal with an expiry already in the past.
+        past = UrlSealer(SECRET, enroll_url="https://example.invalid/")
+        with mock.patch("loseit_mcp.sealed.time.time", return_value=0.0):
+            expired = past.seal(EMAIL, PASSWORD, ttl_days=1)
+        with pytest.raises(SealError) as caught:
+            sealer.open(expired)
+        assert "https://example.invalid/" in str(caught.value)
+
+    def test_the_message_is_still_identical_for_every_failure(self) -> None:
+        """Naming the remedy must not turn the error into an oracle that
+        distinguishes expiry from tampering from a rotated secret."""
+        sealer = UrlSealer(SECRET, enroll_url="https://example.invalid/")
+        good = sealer.seal(EMAIL, PASSWORD)
+        wrong_secret = UrlSealer(b"pQ3zX8vB2nM6kL0jH4gF7dS1aW5eR9tYcJ4kP8nZ").seal(EMAIL, PASSWORD)
+        with mock.patch("loseit_mcp.sealed.time.time", return_value=0.0):
+            expired = sealer.seal(EMAIL, PASSWORD, ttl_days=1)
+
+        messages = set()
+        for bad in (wrong_secret, expired, good[:-4], good + "AAAA", "not-base64!!"):
+            with pytest.raises(SealError) as caught:
+                sealer.open(bad)
+            messages.add(str(caught.value))
+        assert len(messages) == 1, "the error distinguishes failure modes"
+
+    def test_without_a_configured_url_it_stays_generic(self) -> None:
+        sealer = UrlSealer(SECRET)
+        stale = UrlSealer(b"pQ3zX8vB2nM6kL0jH4gF7dS1aW5eR9tYcJ4kP8nZ").seal(EMAIL, PASSWORD)
+        with pytest.raises(SealError) as caught:
+            sealer.open(stale)
+        assert "enrollment page" in str(caught.value)
+
+
+class TestPublicEnrollUrlDiscovery:
+    """The hostname is derived at runtime rather than hardcoded, so no
+    particular deployment's address ends up in the source."""
+
+    def test_it_uses_the_app_service_hostname(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from loseit_mcp.cli import _public_enroll_url
+
+        monkeypatch.delenv("LOSEIT_PUBLIC_URL", raising=False)
+        monkeypatch.setenv("WEBSITE_HOSTNAME", "example.azurewebsites.net")
+        assert _public_enroll_url() == "https://example.azurewebsites.net/"
+
+    def test_an_explicit_override_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from loseit_mcp.cli import _public_enroll_url
+
+        monkeypatch.setenv("WEBSITE_HOSTNAME", "example.azurewebsites.net")
+        monkeypatch.setenv("LOSEIT_PUBLIC_URL", "https://diary.example.com")
+        assert _public_enroll_url() == "https://diary.example.com/"
+
+    def test_it_falls_back_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from loseit_mcp.cli import _public_enroll_url
+
+        monkeypatch.delenv("LOSEIT_PUBLIC_URL", raising=False)
+        monkeypatch.delenv("WEBSITE_HOSTNAME", raising=False)
+        assert _public_enroll_url() is None
+
+    def test_no_real_deployment_hostname_is_hardcoded(self) -> None:
+        """Guards the rule that a specific deployment's address stays out of
+        the repo.
+
+        Generic examples are fine and necessary — this only objects to a
+        hostname that looks like somebody's actual instance rather than a
+        placeholder.
+        """
+        import pathlib
+        import re
+
+        pattern = re.compile(r"([A-Za-z0-9<>-]+)\.azurewebsites\.net")
+        offenders: list[str] = []
+        for path in pathlib.Path("src/loseit_mcp").rglob("*.py"):
+            for label in pattern.findall(path.read_text(encoding="utf-8")):
+                placeholder = (
+                    label.startswith("my-") or "example" in label or "<" in label
+                )
+                if not placeholder:
+                    offenders.append(f"{path}: {label}.azurewebsites.net")
+        assert not offenders, f"real-looking hostname in source: {offenders}"
 
 
 class TestDeployedWiring:

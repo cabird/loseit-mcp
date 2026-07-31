@@ -48,7 +48,7 @@ class TestRetrying:
     def test_retries_once_after_reauthenticating(self, settings: Any) -> None:
         svc = LoseItService(settings)
         calls: list[int] = []
-        svc._reauthenticate = lambda: calls.append(1)  # type: ignore[method-assign]
+        svc._reauthenticate = lambda seen_generation=None: calls.append(1)  # type: ignore[method-assign]
 
         attempts = {"n": 0}
 
@@ -64,7 +64,7 @@ class TestRetrying:
     def test_does_not_retry_non_auth_errors(self, settings: Any) -> None:
         svc = LoseItService(settings)
         calls: list[int] = []
-        svc._reauthenticate = lambda: calls.append(1)  # type: ignore[method-assign]
+        svc._reauthenticate = lambda seen_generation=None: calls.append(1)  # type: ignore[method-assign]
 
         with pytest.raises(LoseItError):
             svc._retrying(lambda: (_ for _ in ()).throw(LoseItError("GWT error: Boom")))

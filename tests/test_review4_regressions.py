@@ -186,6 +186,7 @@ class TestWeightHistorySpanCap:
         svc._client = None
         svc._inflight = 0
         svc._retired = []
+        svc._generation = 0
         return svc
 
     def test_rejects_an_unbounded_start(self) -> None:
@@ -252,6 +253,7 @@ class TestReauthDoesNotCloseInFlightClients:
         svc._lock = threading.RLock()
         svc._inflight = 0
         svc._retired = []
+        svc._generation = 0
         svc.on_reauthenticated = None
         return svc
 

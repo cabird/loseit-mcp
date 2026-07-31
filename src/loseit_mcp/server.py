@@ -31,21 +31,99 @@ from .tenancy import SessionResolver, resolve_or_raise
 INSTRUCTIONS = """\
 Read and write the user's Lose It! food diary.
 
-Typical flow for logging a meal:
-1. `search_food` to find the food and get its `food_id`.
-2. `log_food` with that `food_id`, a meal, and a portion.
+Logging a meal:
+1. `search_food` returns candidates with nutrition. Entries are user-submitted
+   and often wrong, so compare them rather than taking the first: a sound entry
+   has protein*4 + carb*4 + fat*9 near its calories, and values that recur
+   across duplicates are the trustworthy ones.
+2. `log_food` with the chosen `food_id`, a meal, and a portion.
 
-Portions: pass `serving_amount` + `serving_unit` (e.g. 120 + "g") when you know
-a concrete quantity, otherwise pass `servings` as a multiplier of the food's
-default serving. Supply one form or the other, never both. Use `dry_run=true`
-to preview the calorie math without writing.
+Prefer parts over wholes: a Chipotle bowl is chicken + rice + beans + sour
+cream, each searched and logged separately.
 
-If `search_food` has no good match — a restaurant dish, a homemade meal — use
-`log_custom_food` to record the calories and macros directly instead of forcing
-a bad match.
+Portions: `serving_amount` + `serving_unit` (e.g. 120 + "g") for a concrete
+quantity, else `servings` as a multiplier of the serving shown in the search
+result. One or the other, never both. `dry_run=true` previews the math.
 
-Deleting: call `get_diary` first to get an `entry_id`, then `delete_entry`.
+`log_custom_food` is a last resort, after searching for both the dish and its
+parts.
+
+Deleting: `get_diary` for an `entry_id`, then `delete_entry`.
 """
+
+
+def _cell(text: str) -> str:
+    """Make a user-submitted string safe to place in a delimited row.
+
+    Food names come from Lose It's public, user-submitted database, so they can
+    contain anything — including a newline and a pipe, which is enough to forge
+    an entire extra row with a different food_id and let a model log something
+    nobody offered. Verified before this guard existed.
+    """
+    flattened = " ".join(str(text).split())
+    return flattened.replace("|", "/")
+
+
+def _gram(nutrients: dict[str, Any], key: str) -> str:
+    """One macro, rounded, or ``?`` when the entry doesn't carry it.
+
+    Deliberately not ``0``: a missing nutrient is unknown, and printing zero
+    would invite logging a food as having none of it. Values below 1 keep a
+    significant digit for the same reason — rounding 0.4 g to "0" states the
+    very thing this is trying to avoid.
+    """
+    value = nutrients.get(key)
+    if value is None:
+        return "?"
+    if 0 < abs(value) < 1:
+        return f"{value:.2g}"
+    return f"{round(value):g}"
+
+
+def _format_search(query: str, hits: list[dict[str, Any]]) -> str:
+    """Render search hits as text rather than JSON.
+
+    JSON repeats every key on every row; for five enriched candidates that is
+    roughly eight times the tokens of the same information laid out in columns.
+    The layout matters as much as the size: putting the candidates in aligned
+    rows is what makes an entry claiming 90 calories for the same macros as its
+    four 278-calorie siblings visible at a glance.
+
+    Values are stated per the serving shown, because Lose It stores them that
+    way and the serving differs between otherwise identical entries.
+    """
+    if not hits:
+        return f'No matches for "{query}". Try a shorter or more common name.'
+
+    lines = [
+        f'{len(hits)} matches for "{query}". Values are per the serving shown.',
+        "name (brand) | cal | protein/carb/fat g | serving | food_id",
+    ]
+    for index, hit in enumerate(hits, 1):
+        name = _cell(hit.get("name") or "(unnamed)")
+        brand = hit.get("brand")
+        label = f"{name} ({_cell(brand)})" if brand else name
+        food_id = _cell(hit.get("food_id") or "?")
+
+        nutrients = hit.get("nutrients_per_serving") or {}
+        if not hit.get("nutrition_available") or not nutrients:
+            # Keep the column count so the row still aligns with the header,
+            # but say plainly that the blanks are missing data.
+            lines.append(f"{index}. {label} | ? | ?/?/? | ? | {food_id}  (nutrition unavailable)")
+            continue
+
+        serving = hit.get("primary_serving") or {}
+        amount = serving.get("native_qty_per_serving")
+        unit = _cell(serving.get("unit") or "serving")
+        portion = f"{round(amount, 3):g} {unit}" if isinstance(amount, int | float) else unit
+
+        lines.append(
+            f'{index}. {label} | {_gram(nutrients, "calories")} | '
+            f'{_gram(nutrients, "protein_g")}/{_gram(nutrients, "carb_g")}'
+            f'/{_gram(nutrients, "total_fat_g")} | '
+            f"{portion} | {food_id}"
+        )
+    return "\n".join(lines)
 
 
 def build_server(
@@ -110,17 +188,19 @@ def build_server(
 
     @mcp.tool(
         description=(
-            "Search the Lose It! food database. Returns candidate foods with a "
-            "`food_id` to pass to log_food or describe_food."
+            "Search the Lose It! food database. Returns candidate foods with "
+            "their nutrition and a `food_id` to pass to log_food. Compare the "
+            "candidates before choosing one — the database is user-submitted "
+            "and contains entries whose calories contradict their own macros."
         )
     )
     def search_food(
         ctx: Context,
         query: Annotated[str, Field(description="Food name to search for, e.g. 'greek yogurt'.")],
         limit: Annotated[int, Field(description="Max results to return.", ge=1, le=50)] = 10,
-    ) -> list[dict[str, Any]]:
+    ) -> str:
         with acquire(ctx) as svc:
-            return svc.search_food(query, limit=limit)
+            return _format_search(query, svc.search_food(query, limit=limit))
 
     @mcp.tool(
         description=(
@@ -347,7 +427,10 @@ def build_server(
                     "hours_from_gmt": identity.get("hours_from_gmt"),
                 }
                 try:
-                    svc.search_food("water", limit=1)
+                    # detail=False: this is a reachability probe, and enriching
+                    # would make a nutrition failure look like Lose It being
+                    # down when the search itself succeeded.
+                    svc.search_food("water", limit=1, detail=False)
                     status["loseit_reachable"] = True
                 except Exception as exc:  # noqa: BLE001 - reported, not raised
                     status["loseit_reachable"] = False

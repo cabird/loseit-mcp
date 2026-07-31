@@ -12,16 +12,18 @@ import re
 import threading
 import uuid
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Self, TypeVar
 
 from lose_it import LoseIt, MealType, UnsavedFoodLogEntry
 from lose_it.core import entries as _entries
+from lose_it.core import foods as _foods
 from lose_it.core._config import Config
 from lose_it.core._dates import day_number_for
 from lose_it.core._http import LoseItAuthError, LoseItError
-from lose_it.core._ids import pk_to_hex
+from lose_it.core._ids import hex_to_pk, pk_to_hex
 from lose_it.core.daily import get_daydate_key
 
 from .auth import Session, resolve_session
@@ -156,6 +158,9 @@ class LoseItService:
         # parked here and closed once nothing is using them.
         self._inflight = 0
         self._retired: list[LoseIt] = []
+        # Bumped on every successful re-login, so concurrent callers that fail
+        # against the same dead session don't each mint a replacement.
+        self._generation = 0
         # Optional hook so a caller-managed cache can be refreshed when we mint
         # a new session behind its back. Set by the multi-tenant resolver.
         self.on_reauthenticated: Callable[[Session], None] | None = None
@@ -188,9 +193,17 @@ class LoseItService:
         )
         return LoseIt(config, session.token)
 
-    def _reauthenticate(self) -> None:
-        """Force a fresh login and rebuild the underlying client."""
+    def _reauthenticate(self, seen_generation: int | None = None) -> None:
+        """Force a fresh login and rebuild the underlying client.
+
+        ``seen_generation`` lets a caller say which session it was using when
+        it failed. If someone else has already replaced that session, there is
+        nothing to do — re-logging in again would just invalidate the session
+        the other caller is about to succeed with.
+        """
         with self._lock:
+            if seen_generation is not None and seen_generation != self._generation:
+                return
             # Retire rather than close: another thread may be issuing a request
             # through this client right now, and closing its connection pool
             # would fail that request with a confusing transport error.
@@ -203,6 +216,7 @@ class LoseItService:
             session = resolve_session(self._settings, force_login=True)
             self._session = session
             self._client = self._build_client(session)
+            self._generation += 1
             reclaimed = self._reclaim_retired()
 
         for client in reclaimed:
@@ -239,14 +253,22 @@ class LoseItService:
                 client.close()
 
     def _retrying(self, fn: Callable[[], _T]) -> _T:
-        """Run ``fn``, retrying once after re-authenticating on auth failure."""
+        """Run ``fn``, retrying once after re-authenticating on auth failure.
+
+        Records the session generation before running. If several callers fail
+        together — which is exactly what happens when a token expires while a
+        search has eight enrichment threads in flight — only the first performs
+        the re-login; the rest see a newer generation and simply retry against
+        the session it produced, instead of queuing eight sequential logins.
+        """
+        generation = self._generation
         try:
             with self._in_flight():
                 return fn()
         except Exception as exc:
             if not _is_auth_failure(exc):
                 raise
-            self._reauthenticate()
+            self._reauthenticate(seen_generation=generation)
             with self._in_flight():
                 return fn()
 
@@ -297,14 +319,83 @@ class LoseItService:
             "hours_from_gmt": self._settings.hours_from_gmt,
         }
 
-    def search_food(self, query: str, limit: int = 15) -> list[dict[str, Any]]:
-        """Search the Lose It! food database."""
+    def search_food(
+        self,
+        query: str,
+        limit: int = 15,
+        *,
+        detail: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Search the Lose It! food database.
+
+        With ``detail`` (the default) each hit is enriched with its nutrition
+        and serving. The search RPC returns only name/brand/category/id, so
+        without this a caller comparing five candidates pays six round trips —
+        and in practice settles for one, which is how an entry whose calories
+        contradict its own macros gets reported as fact.
+
+        Enrichment is per-food best-effort: one unresolvable hit yields a
+        result carrying just its name, never an exception for the whole search.
+        """
         results = self._call("search", query)
-        return [_food_to_dict(r) for r in results[:limit]]
+        hits = [_food_to_dict(r) for r in results[:limit]]
+        if not detail or not hits:
+            return hits
+
+        # Serialized, these are ~0.2s each; a five-candidate comparison would
+        # otherwise spend over a second doing nothing but waiting. Only the
+        # first few are enriched — see _MAX_ENRICHED.
+        enriched = list(_ENRICH_POOL.map(self._enrich_hit, hits[:_MAX_ENRICHED]))
+        return enriched + [{**h, "nutrition_available": False} for h in hits[_MAX_ENRICHED:]]
+
+    def _enrich_hit(self, hit: dict[str, Any]) -> dict[str, Any]:
+        """Attach nutrition to one search hit, or leave it as-is.
+
+        Auth failures are re-raised rather than absorbed: the outer
+        :meth:`_retrying` needs to see them to re-authenticate, and swallowing
+        them would report every food as having no nutrition and keep doing so
+        until some unrelated call happened to refresh the token.
+        """
+        try:
+            detail = self.describe_food(hit["food_id"])
+        except Exception as exc:
+            if _is_auth_failure(exc):
+                raise
+            return {**hit, "nutrition_available": False}
+        return {
+            **hit,
+            "name": detail.get("name") or hit.get("name"),
+            "brand": detail.get("brand") or hit.get("brand"),
+            "nutrition_available": True,
+            "primary_serving": detail.get("primary_serving"),
+            "nutrients_per_serving": detail.get("nutrients_per_serving"),
+        }
 
     def describe_food(self, food_id: str) -> dict[str, Any]:
-        """Full nutrition detail for a food, by its hex ID."""
-        return _to_dict(self._call("describe_food", food_id))
+        """Full nutrition detail for a food, by its hex ID.
+
+        Deliberately not the SDK's ``describe_food``. That resolves the ID with
+        ``getFood`` before fetching nutrition, and uses the result for nothing
+        but passing along — every field it returns comes from the second call.
+        Worse, ``getFood`` only finds foods that exist as database *records*,
+        so it fails for every food created by :meth:`log_custom_food`, which
+        mints a synthetic key and stores the nutrition on the diary entry
+        itself. Those foods stay in search results forever, undescribable.
+
+        Going straight to ``getUnsavedFoodLogEntry`` costs one RPC instead of
+        two and resolves them. Verified against 90 foods: identical values
+        wherever the old path worked, and working for the six where it didn't.
+
+        Runs through :meth:`_retrying` like every other network call here, so
+        an expired token re-authenticates and the request is registered
+        in-flight — without that, a concurrent re-login closes the client
+        underneath it.
+        """
+        return self._retrying(
+            lambda: _describe_from_unsaved(
+                food_id, _get_unsaved(self.client.http, _food_ref(food_id))
+            )
+        )
 
     def get_diary(self, when: str | date | None = None) -> dict[str, Any]:
         """All food log entries for a day."""
@@ -353,13 +444,38 @@ class LoseItService:
             "when": self._day(when),
             "dry_run": dry_run,
         }
+        # Resolve the food first. Passing a bare ID would make the SDK call
+        # `getFood`, which only finds database records and so fails for
+        # anything log_custom_food created — "log what I had last week" is
+        # exactly when that gets attempted. Resolving here also supplies the
+        # name and brand for the confirmation, which a reference built from an
+        # ID alone cannot carry, and tells us whether this food is measured by
+        # weight before we interpret an ounce.
+        detail = self.describe_food(food_id)
+        ref = _food_ref(food_id, name=detail.get("name") or "", brand=detail.get("brand") or "")
+
         if serving_amount is not None:
+            serving_amount, serving_unit, note = _normalise_ounces(
+                serving_amount, serving_unit, detail
+            )
             kwargs["serving_amount"] = serving_amount
             kwargs["serving_unit"] = serving_unit
             kwargs["servings"] = 1.0
         else:
+            note = None
             kwargs["servings"] = 1.0 if servings is None else servings
-        return _to_dict(self._call("log_food", food_id, **kwargs))
+
+        result = _to_dict(self._call("log_food", ref, **kwargs))
+        # The SDK echoes back the reference it was handed, so without this the
+        # confirmation for a *write* would not say what was written.
+        food = result.get("food")
+        if isinstance(food, dict):
+            food.setdefault("food_id", food_id)
+            food["name"] = food.get("name") or detail.get("name") or ""
+            food["brand"] = food.get("brand") or detail.get("brand") or ""
+        if note:
+            result["unit_interpreted_as"] = note
+        return result
 
     def log_custom_food(
         self,
@@ -645,6 +761,169 @@ def _round(value: Any, places: int = 2) -> Any:
 # as the multiplier — so `servings=2` means 200 g, not 2 g.
 _GRAMS_ORDINAL = 8
 _GRAMS_PER_SERVING = 100.0
+
+# Measure ordinals the SDK leaves unlabelled, which surface as
+# ``unknown_ord_<N>`` and read as noise to a model comparing candidates.
+#
+# Ordinal 6 is the weight ounce. Established by probing 56 foods: the gram
+# weight per unit clusters on 28.0 and 28.3495 (a rounded and an exact ounce),
+# and the giveaway is the fractional quantities — 113 g stored as 4.03571
+# units, 128 g as 4.57143 — which are gram weights divided by an ounce
+# constant, not numbers anybody typed. It sits alongside GRAMS=8 and
+# FLUID_OUNCE=10, so a weight-ounce slot is exactly what the enum was missing.
+#
+# A minority of entries (all `qty=3.0, g=100.0`) are USDA per-100g records
+# whose author set the display quantity to the conventional 3 oz serving
+# without reconciling it — those really do claim 3 oz for 100 g. This is why
+# the label is for *display only*: every conversion still goes through the
+# food's own `per_serving_g`, so a mislabelled entry reads oddly but never
+# computes wrongly.
+_MEASURE_LABEL_OVERRIDES = {6: "oz"}
+
+# Weight ounces, converted here rather than passed through. The SDK rejects a
+# bare "oz" as ambiguous between weight and fluid, which was reasonable while
+# ordinal 6 was unlabelled — but now that a search result can read "18 oz", a
+# caller will quite reasonably try to log "9 oz" and hit that refusal.
+#
+# Converting to grams resolves the ambiguity in the direction the label
+# implies, and is more accurate than trusting the food's own unit: the entries
+# that claim 3 oz for 100 g would otherwise log 18% heavy. Fluid ounces still
+# go through untouched, because those really are a different measurement.
+_GRAMS_PER_OUNCE = 28.349523125
+_ML_PER_FLUID_OUNCE = 29.5735295625
+_OUNCE_ALIASES = frozenset({"oz", "ounce", "ounces"})
+
+
+def _normalise_ounces(
+    amount: float, unit: str | None, detail: dict[str, Any]
+) -> tuple[float, str | None, str | None]:
+    """Resolve a bare "oz" against the food, returning what we decided.
+
+    The SDK refuses a bare "oz" because it can mean a weight ounce (~28.35 g)
+    or a fluid ounce (~29.57 mL). That refusal was right while ordinal 6 was
+    unlabelled, but a search result now reads "18 oz", so a caller will try to
+    log "9 oz" and deserve better than a rejection.
+
+    The ambiguity is resolved against the food rather than globally: something
+    sold by weight becomes grams, something that only carries a volume becomes
+    fluid ounces. "8 oz of milk" therefore stays a volume instead of silently
+    logging 227 g where 244 g was meant. The decision is reported back in
+    ``unit_interpreted_as`` so it is never silent.
+    """
+    if unit is None or unit.strip().lower() not in _OUNCE_ALIASES:
+        return amount, unit, None
+
+    conversion = detail.get("cross_class_conversion") or {}
+    if conversion.get("per_serving_g") is not None:
+        return amount * _GRAMS_PER_OUNCE, "g", f"weight ounces ({_GRAMS_PER_OUNCE:g} g each)"
+    if conversion.get("per_serving_ml") is not None:
+        return amount, "fl_oz", "fluid ounces (this food is measured by volume)"
+    # Nothing to go on; weight is the commoner reading for a bare "oz".
+    return amount * _GRAMS_PER_OUNCE, "g", f"weight ounces ({_GRAMS_PER_OUNCE:g} g each)"
+
+
+def _measure_label(ordinal: int | None, sdk_label: str | None) -> str | None:
+    """Prefer the SDK's label, filling gaps we have evidence for."""
+    if sdk_label and not sdk_label.startswith("unknown_ord_"):
+        return sdk_label
+    return _MEASURE_LABEL_OVERRIDES.get(ordinal, sdk_label)
+
+
+def _food_ref(food_id: str, *, name: str = "", brand: str = "") -> Any:
+    """A minimal food reference for ``getUnsavedFoodLogEntry``.
+
+    Name, brand and category default to empty on purpose: the RPC carries them
+    but the server ignores them entirely and answers from the primary key.
+    Confirmed by sending a deliberately wrong name with a valid key (the key
+    won) and by sending no name at all (still correct). Not relying on them
+    is what lets this resolve a food from an ID alone.
+
+    They can still be supplied, because the SDK echoes this object back in the
+    logging result — where an empty name leaves a write confirmation that
+    doesn't say what was written.
+    """
+    return _foods.FoodSearchResult(
+        name=name, brand=brand, category="", pk_bytes=hex_to_pk(food_id)
+    )
+
+
+def _get_unsaved(http: Any, ref: Any) -> UnsavedFoodLogEntry:
+    return _foods.get_unsaved_food_log_entry(http, ref)
+
+
+def _describe_from_unsaved(food_id: str, unsaved: UnsavedFoodLogEntry) -> dict[str, Any]:
+    """Project an unsaved entry into the shape ``describe_food`` returns.
+
+    ``raw_nutrients_by_ord`` is dropped: it restates ``nutrients_per_serving``
+    by ordinal, and shipping both doubles the payload for no reader. Unmapped
+    nutrients are kept — this tool promises full detail, and an unrecognised
+    micronutrient is still data the caller asked for.
+
+    Raises when the response is blank. ``getUnsavedFoodLogEntry`` answers an
+    unknown key with a default-constructed entry rather than an error, so
+    without this a stale or invented ID would return a plausible-looking food
+    with no name and no nutrients — which reads as "this food has no calories"
+    rather than "this food does not exist".
+    """
+    nutrients = {
+        label: _round(value) for label, value in (unsaved.nutrients_by_label or {}).items()
+    }
+    if not (unsaved.name or "").strip() and not nutrients:
+        raise LoseItError(f"Food with id {food_id} not found")
+
+    return {
+        "food_id": food_id,
+        "name": _unescape(unsaved.name or ""),
+        "brand": _unescape(unsaved.brand or ""),
+        "category": unsaved.category or "",
+        "primary_serving": {
+            "ordinal": unsaved.food_measure_ordinal,
+            "unit": _measure_label(unsaved.food_measure_ordinal, unsaved.food_measure_unit),
+            "canonical_per_serving": _round(unsaved.canonical_per_serving),
+            "native_qty_per_serving": _round(_native_qty_per_serving(unsaved), 3),
+        },
+        "cross_class_conversion": {
+            "per_serving_g": _round(unsaved.per_serving_g),
+            "per_serving_ml": _round(unsaved.per_serving_ml),
+        },
+        "nutrients_per_serving": nutrients,
+    }
+
+
+def _native_qty_per_serving(unsaved: UnsavedFoodLogEntry) -> float | None:
+    """How much of the food, in its own unit, one serving actually is.
+
+    The raw field is only half the answer. Per the SDK's own model notes the
+    per-serving quantity is ``f4 / f3`` — ``native_qty_per_serving`` divided by
+    ``canonical_per_serving`` — and roughly 40% of foods carry a ``f3`` that
+    isn't 1.
+
+    Reporting the raw value understates those badly, and the errors are not
+    subtle: whole almonds are stored as 575 calories against ``f4=1 each`` with
+    ``f3=0.012``, so the honest figure is 83 almonds, not one. Rice and oils
+    are wrong the same way. The SDK's own CLI prints the raw field and has the
+    same flaw.
+    """
+    native = unsaved.native_qty_per_serving
+    canonical = unsaved.canonical_per_serving
+    if native is None:
+        return None
+    if not canonical:
+        return native
+    return native / canonical
+
+
+# Enrichment fans out one RPC per hit, so it is capped independently of the
+# caller's `limit`: throttling admits a request, not the however-many upstream
+# calls it turns into, and comparing candidates needs a handful rather than 50.
+_ENRICH_WORKERS = 8
+_MAX_ENRICHED = 10
+
+# One pool for the whole process. A pool per call would let MCP's own thread
+# dispatch (40 concurrent sync tools by default) multiply into hundreds of
+# threads and upstream connections, which is precisely the ceiling anyio's
+# limiter exists to impose.
+_ENRICH_POOL = ThreadPoolExecutor(max_workers=_ENRICH_WORKERS, thread_name_prefix="loseit-enrich")
 
 
 def _display_portion(data: dict[str, Any]) -> tuple[float | None, str | None]:

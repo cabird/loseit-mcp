@@ -41,7 +41,11 @@ def healthy(monkeypatch: pytest.MonkeyPatch) -> None:
             "hours_from_gmt": -7,
         },
     )
-    monkeypatch.setattr(LoseItService, "search_food", lambda self, q, limit=1: [{"name": "Water"}])
+    monkeypatch.setattr(
+        LoseItService,
+        "search_food",
+        lambda self, q, limit=1, detail=True: [{"name": "Water"}],
+    )
 
 
 class TestToolSurface:
@@ -105,7 +109,7 @@ class TestDegradedServer:
             lambda self: {"user_name": "Tester", "email": "u@example.com", "hours_from_gmt": -7},
         )
 
-        def boom(self: Any, query: str, limit: int = 1) -> Any:
+        def boom(self: Any, query: str, limit: int = 1, detail: bool = True) -> Any:
             raise LoseItError("Unexpected response: <html>")
 
         monkeypatch.setattr(LoseItService, "search_food", boom)

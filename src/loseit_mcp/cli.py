@@ -485,7 +485,9 @@ def _run_command(args: argparse.Namespace, settings: Settings) -> int:
             _print_json(svc.whoami())
 
         elif args.command == "search":
-            results = svc.search_food(args.query, limit=args.limit)
+            # No detail: this command prints id/name/brand only, so enriching
+            # would pay one RPC per hit for data nothing here displays.
+            results = svc.search_food(args.query, limit=args.limit, detail=False)
             _print_json(results) if as_json else _print_search(results)
 
         elif args.command == "describe":

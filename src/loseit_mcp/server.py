@@ -192,7 +192,13 @@ def build_server(
             "their nutrition and a `food_id` to pass to log_food. Compare the "
             "candidates before choosing one — the database is user-submitted "
             "and contains entries whose calories contradict their own macros."
-        )
+        ),
+        # This tool answers with prose, not a record. Left on, the framework
+        # derives an output schema of {"result": string} from the return
+        # annotation and then sends no structuredContent to satisfy it, which
+        # is a protocol violation: a client that validates the declared schema
+        # rejects every response and the connection looks broken.
+        structured_output=False,
     )
     def search_food(
         ctx: Context,

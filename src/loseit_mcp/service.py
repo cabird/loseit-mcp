@@ -8,6 +8,9 @@ and CLI layers can hand results straight to a client.
 
 from __future__ import annotations
 
+import concurrent.futures
+import logging
+import random
 import re
 import threading
 import time
@@ -18,6 +21,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Self, TypeVar
 
+import httpx
 from lose_it import LoseIt, MealType, UnsavedFoodLogEntry
 from lose_it.core import entries as _entries
 from lose_it.core import foods as _foods
@@ -29,10 +33,24 @@ from lose_it.core.daily import get_daydate_key
 
 from .auth import Session, resolve_session
 from .config import Settings
+from .observability import current_request_id
 from .weight import get_weight_history as _get_weight_history
 from .weight import save_weight
 
 _T = TypeVar("_T")
+
+logger = logging.getLogger(__name__)
+
+# Cap on how much of an upstream error reaches the log. GWT envelopes can be
+# long and can echo server-side text; the exception *class* and a short prefix
+# are what identify a fault, and the rest is not worth the risk of carrying
+# something we didn't anticipate into a log aggregator.
+_BRIEF_CHARS = 160
+
+
+def _brief(exc: Exception) -> str:
+    """A short, log-safe description of an exception."""
+    return f"{type(exc).__name__}: {str(exc)[:_BRIEF_CHARS]}"
 
 # FoodNutrient enum ordinals the server accepts inside a logged entry.
 #
@@ -95,20 +113,35 @@ def _is_auth_failure(exc: Exception) -> bool:
 # sitting, on the search RPC specifically and not on food lookups. It carries
 # no detail and clears on an immediate retry, so it is a fault on their side
 # rather than anything about the request.
+#
+# Deliberately *not* including IncompatibleRemoteServiceException: that means
+# Lose It shipped a new GWT build, which is permanent until an operator
+# refreshes the strong name. `errors.translate` says as much in the message it
+# produces, so retrying it burns the budget during a total outage to arrive at
+# an answer that already said retrying won't help.
 _TRANSIENT_MARKERS = (
     "java.lang.RuntimeException",
     "java.lang.NullPointerException",
-    "IncompatibleRemoteServiceException",
 )
 
-# Deliberately small. These retries sit inside a single tool call, where no
-# rate limiter gets another say, so the ceiling has to live here.
-_TRANSIENT_ATTEMPTS = 4
+# One budget covering *both* the auth retry and transient retries. Kept
+# together on purpose: nesting one loop inside the other multiplies them, and
+# an earlier arrangement could reach four real password logins from a single
+# read — a plausible route to tripping Lose It's own account protection.
+_READ_ATTEMPTS = 4
 _TRANSIENT_BACKOFF = 0.3
 
 
 def _is_transient_upstream(exc: Exception) -> bool:
-    """True if ``exc`` is a Lose It hiccup that a retry is likely to clear."""
+    """True if ``exc`` is a hiccup that a retry is likely to clear.
+
+    Transport failures count. A connection reset or read timeout between a
+    container and a third-party API is the commonest transient fault in a
+    hosted deployment, and it is the one class where retrying a read is
+    unambiguously safe.
+    """
+    if isinstance(exc, httpx.TransportError):
+        return True
     if not isinstance(exc, LoseItError) or _is_auth_failure(exc):
         return False
     return any(marker in str(exc) for marker in _TRANSIENT_MARKERS)
@@ -242,7 +275,10 @@ class LoseItService:
             self._session = session
             self._client = self._build_client(session)
             self._generation += 1
+            generation = self._generation
             reclaimed = self._reclaim_retired()
+
+        logger.info("re-authenticated, session generation=%d", generation)
 
         for client in reclaimed:
             client.close()
@@ -297,26 +333,55 @@ class LoseItService:
             with self._in_flight():
                 return fn()
 
-    def _reading(self, fn: Callable[[], _T]) -> _T:
-        """Run a *read*, retrying Lose It's intermittent server-side faults.
+    def _reading(self, fn: Callable[[], _T], *, what: str = "read") -> _T:
+        """Run a *read* under one attempt budget covering auth and transient faults.
 
         Only for reads. A write that appears to fail may still have been
-        applied, so retrying one risks logging the same food twice — far worse
-        than surfacing the error. Auth failures are handled by
-        :meth:`_retrying` underneath and are not counted here.
+        applied, so retrying one risks logging the same food twice.
+
+        The budget is shared rather than nested. Running a transient loop
+        around the auth loop multiplied them, and could reach four real logins
+        from a single read — invisible, and enough to look like an attack to
+        Lose It's own protections.
         """
+        generation = self._generation
         last: Exception | None = None
-        for attempt in range(_TRANSIENT_ATTEMPTS):
+        relogins = 0
+        for attempt in range(1, _READ_ATTEMPTS + 1):
             try:
-                return self._retrying(fn)
+                with self._in_flight():
+                    return fn()
             except Exception as exc:
-                if not _is_transient_upstream(exc):
-                    raise
                 last = exc
-                if attempt + 1 < _TRANSIENT_ATTEMPTS:
-                    time.sleep(_TRANSIENT_BACKOFF * (attempt + 1))
-        assert last is not None
-        raise last
+                final = attempt == _READ_ATTEMPTS
+                if _is_auth_failure(exc):
+                    # One re-login per read. Three back-to-back password logins
+                    # in a few hundred milliseconds is lockout-shaped, and if
+                    # the first re-auth didn't fix it a second won't.
+                    if final or relogins:
+                        raise
+                    relogins += 1
+                    logger.info("auth expired during %s, re-authenticating", what)
+                    self._reauthenticate(seen_generation=generation)
+                    generation = self._generation
+                    time.sleep(_TRANSIENT_BACKOFF * random.uniform(0.5, 1.5))
+                    continue
+                if not _is_transient_upstream(exc) or final:
+                    if _is_transient_upstream(exc):
+                        logger.error(
+                            "%s failed after %d attempts: %s", what, attempt, _brief(exc)
+                        )
+                    raise
+                delay = _TRANSIENT_BACKOFF * attempt * random.uniform(0.5, 1.5)
+                logger.warning(
+                    "transient upstream fault on %s (attempt %d/%d): %s",
+                    what,
+                    attempt,
+                    _READ_ATTEMPTS,
+                    _brief(exc),
+                )
+                time.sleep(delay)
+        raise last  # pragma: no cover - the loop always returns or raises
 
     def _call(self, fn_name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke an SDK method, retrying once after a re-login on auth failure."""
@@ -383,7 +448,8 @@ class LoseItService:
         Enrichment is per-food best-effort: one unresolvable hit yields a
         result carrying just its name, never an exception for the whole search.
         """
-        results = self._reading(lambda: self.client.search(query))
+        started = time.monotonic()
+        results = self._reading(lambda: self.client.search(query), what="search_food")
         hits = [_food_to_dict(r) for r in results[:limit]]
         if not detail or not hits:
             return hits
@@ -391,23 +457,54 @@ class LoseItService:
         # Serialized, these are ~0.2s each; a five-candidate comparison would
         # otherwise spend over a second doing nothing but waiting. Only the
         # first few are enriched — see _MAX_ENRICHED.
-        enriched = list(_ENRICH_POOL.map(self._enrich_hit, hits[:_MAX_ENRICHED]))
-        return enriched + [{**h, "nutrition_available": False} for h in hits[_MAX_ENRICHED:]]
+        #
+        # Futures are submitted explicitly rather than via `map` so that a
+        # failure can wait for the workers already running. `map` cancels only
+        # *pending* futures, leaving up to seven live requests behind — which
+        # then keep using a client the request's `finally` has already closed.
+        targets = hits[:_MAX_ENRICHED]
+        futures = [_ENRICH_POOL.submit(self._enrich_hit, h) for h in targets]
+        try:
+            enriched = [f.result() for f in futures]
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            concurrent.futures.wait(futures)
+            raise
+        rest = [{**h, "nutrition_available": False} for h in hits[_MAX_ENRICHED:]]
+        degraded = [h for h in enriched if not h.get("nutrition_available")]
+        logger.info(
+            "search_food id=%s hits=%d enriched=%d degraded=%d elapsed_ms=%d%s",
+            current_request_id() or "-",
+            len(hits),
+            len(enriched) - len(degraded),
+            len(degraded) + len(rest),
+            int((time.monotonic() - started) * 1000),
+            # One representative reason rather than one line per failed hit.
+            f" reason={degraded[0].get('_reason')}" if degraded else "",
+        )
+        for hit in enriched:
+            hit.pop("_reason", None)
+        return enriched + rest
 
     def _enrich_hit(self, hit: dict[str, Any]) -> dict[str, Any]:
         """Attach nutrition to one search hit, or leave it as-is.
 
-        Auth failures are re-raised rather than absorbed: the outer
-        :meth:`_retrying` needs to see them to re-authenticate, and swallowing
-        them would report every food as having no nutrition and keep doing so
-        until some unrelated call happened to refresh the token.
+        Auth failures are re-raised rather than absorbed: the outer read needs
+        to see them to re-authenticate, and swallowing them would report every
+        food as having no nutrition and keep doing so until some unrelated
+        call happened to refresh the token.
         """
         try:
-            detail = self.describe_food(hit["food_id"])
+            detail = self.describe_food(hit["food_id"], retry=False)
         except Exception as exc:
             if _is_auth_failure(exc):
                 raise
-            return {**hit, "nutrition_available": False}
+            # Counted in the search summary rather than logged per hit: a
+            # degraded upstream would otherwise emit ten records per search,
+            # which is thousands a minute during exactly the outage an
+            # operator is trying to read through.
+            return {**hit, "nutrition_available": False, "_reason": _brief(exc)}
         return {
             **hit,
             "name": detail.get("name") or hit.get("name"),
@@ -417,7 +514,7 @@ class LoseItService:
             "nutrients_per_serving": detail.get("nutrients_per_serving"),
         }
 
-    def describe_food(self, food_id: str) -> dict[str, Any]:
+    def describe_food(self, food_id: str, *, retry: bool = True) -> dict[str, Any]:
         """Full nutrition detail for a food, by its hex ID.
 
         Deliberately not the SDK's ``describe_food``. That resolves the ID with
@@ -432,16 +529,20 @@ class LoseItService:
         two and resolves them. Verified against 90 foods: identical values
         wherever the old path worked, and working for the six where it didn't.
 
-        Runs through :meth:`_retrying` like every other network call here, so
-        an expired token re-authenticates and the request is registered
-        in-flight — without that, a concurrent re-login closes the client
-        underneath it.
+        ``retry=False`` is used by search enrichment, where ten of these run
+        per call: retrying each would multiply one tool call into forty
+        upstream requests, and enrichment already degrades gracefully to
+        "nutrition unavailable" for a hit it cannot resolve.
         """
-        return self._reading(
-            lambda: _describe_from_unsaved(
+
+        def run() -> dict[str, Any]:
+            return _describe_from_unsaved(
                 food_id, _get_unsaved(self.client.http, _food_ref(food_id))
             )
-        )
+
+        if retry:
+            return self._reading(run, what="describe_food")
+        return self._retrying(run)
 
     def get_diary(self, when: str | date | None = None) -> dict[str, Any]:
         """All food log entries for a day."""

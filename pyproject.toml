@@ -1,6 +1,6 @@
 [project]
 name = "loseit-mcp"
-version = "0.3.7"
+version = "0.6.0"
 description = "MCP server for logging food to Lose It!"
 readme = "README.md"
 license = "0BSD"

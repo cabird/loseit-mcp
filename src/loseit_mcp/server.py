@@ -14,6 +14,7 @@ the MCP runtime injects it and keeps it out of the tool's input schema.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import Annotated, Any
@@ -24,9 +25,12 @@ from pydantic import Field
 from . import __version__
 from .config import Settings
 from .errors import translate
+from .observability import account_tag, current_request_id, install_tool_logging
 from .sealed import UrlSealer
 from .service import LoseItService
 from .tenancy import SessionResolver, resolve_or_raise
+
+logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
 Read and write the user's Lose It! food diary.
@@ -160,7 +164,14 @@ def build_server(
                 assert shared is not None
                 yield shared
                 return
-            service, _ = resolve_or_raise(resolver, ctx.headers or {}, sealer)
+            service, creds = resolve_or_raise(resolver, ctx.headers or {}, sealer)
+            # Tag the account so lines from one user can be followed through an
+            # incident. Derived from the email but not reversible to it.
+            logger.info(
+                "account=%s id=%s resolved",
+                account_tag(getattr(creds, "email", None)),
+                current_request_id() or "-",
+            )
             try:
                 yield service
             finally:
@@ -195,9 +206,15 @@ def build_server(
         ),
         # This tool answers with prose, not a record. Left on, the framework
         # derives an output schema of {"result": string} from the return
-        # annotation and then sends no structuredContent to satisfy it, which
-        # is a protocol violation: a client that validates the declared schema
-        # rejects every response and the connection looks broken.
+        # annotation and then ships the whole formatted table *twice* — once as
+        # text content and again as structured content to satisfy that schema.
+        # For a tool whose entire purpose is compactness that doubles the
+        # payload, measured at 2054 bytes against 1030 for ten results.
+        #
+        # An earlier version of this comment claimed the schema went
+        # unsatisfied and broke a client. That was wrong: the framework does
+        # populate it. The client outage was Lose It's intermittent search
+        # fault, fixed separately by retrying reads.
         structured_output=False,
     )
     def search_food(
@@ -453,4 +470,5 @@ def build_server(
         with acquire(ctx) as svc:
             return svc.whoami()
 
+    install_tool_logging(mcp)
     return mcp

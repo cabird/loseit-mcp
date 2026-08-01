@@ -352,6 +352,7 @@ def _transport_security() -> Any:
 def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
     import uvicorn
 
+    from . import build_info
     from .enroll import VERIFY_LIMIT, add_enrollment_route, verify_credentials
     from .server import build_server
     from .webapp import PathTokenMiddleware, install_log_redaction
@@ -429,15 +430,25 @@ def _run_serve(args: argparse.Namespace, settings: Settings) -> int:
         file=sys.stderr,
     )
 
-    if sealer is None:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-        return 0
-
     # Own the logging config so redaction survives: uvicorn's own dictConfig
     # replaces handlers during startup, which would drop filters installed
     # beforehand. Sealed URLs are credentials, so this has to be reliable.
+    #
+    # Applied in both branches. Only the sealer branch can produce /u/<sealed>/
+    # paths today, but nothing enforces that, and the cost of redacting when
+    # there is nothing to redact is zero.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s", force=True)
     install_log_redaction()
+
+    build = build_info()
+    logging.getLogger(__name__).info(
+        "starting version=%s commit=%s image=%s mode=%s",
+        build.get("version"),
+        build.get("commit"),
+        build.get("image_tag"),
+        mode,
+    )
+
     uvicorn.run(app, host=args.host, port=args.port, log_config=None)
     return 0
 

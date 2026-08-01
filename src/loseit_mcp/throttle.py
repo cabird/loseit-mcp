@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -29,6 +30,11 @@ from dataclasses import dataclass
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .paths import split_token_path
+
+logger = logging.getLogger(__name__)
+
+# How often a throttled bucket may produce a log line.
+_REJECTION_LOG_INTERVAL = 60.0
 
 
 @dataclass(frozen=True)
@@ -224,6 +230,8 @@ class ThrottleMiddleware:
         self._credential = Throttle(credential_limit)
         self._trusted_proxies = trusted_proxies
         self._exempt = exempt_paths
+        self._last_rejection_log: dict[str, float] = {}
+        self._rejection_lock = threading.Lock()
 
     def _address_throttle(self, path: str) -> Throttle | None:
         """Pick the address bucket for an *effective* (post-rewrite) path."""
@@ -249,18 +257,42 @@ class ThrottleMiddleware:
             await self._app(scope, receive, send)
             return
 
+        bucket = "address"
         retry_after = by_address.check(client_key(scope, self._trusted_proxies))
 
         if retry_after is None:
             credential = credential_key(scope)
             if credential is not None:
                 retry_after = self._credential.check(credential)
+                if retry_after is not None:
+                    bucket = "credential"
 
         if retry_after is None:
             await self._app(scope, receive, send)
             return
 
+        # Logged on transition rather than per rejection. A 429 is
+        # attacker-controlled and unbounded — nothing stops a client sending a
+        # thousand a second — so a line each would let the flood this exists to
+        # stop take the log with it.
+        if self._note_rejection(bucket):
+            logger.warning(
+                "throttled path=%s bucket=%s retry_after=%.1fs (further rejections suppressed)",
+                effective_path,
+                bucket,
+                retry_after,
+            )
         await _send_429(send, retry_after)
+
+    def _note_rejection(self, bucket: str) -> bool:
+        """True when this rejection is worth a line: at most one per minute."""
+        now = time.monotonic()
+        with self._rejection_lock:
+            last = self._last_rejection_log.get(bucket, 0.0)
+            if now - last < _REJECTION_LOG_INTERVAL:
+                return False
+            self._last_rejection_log[bucket] = now
+            return True
 
 
 async def _send_429(send: Send, retry_after: float) -> None:

@@ -29,6 +29,39 @@ TOKEN_PATH_RE = re.compile(rf"^/u/({_SEGMENT})(/.*)?$")
 # match.
 TOKEN_REDACT_RE = re.compile(r"(/u/)[A-Za-z0-9_-]{32,}")
 
+# A second net for credentials that arrive without their path prefix — a bare
+# sealed segment, or a JWT. Anchoring only on "/u/" means anything logging the
+# segment on its own would slip through.
+#
+# The 64-character floor is what keeps this from being destructive: food IDs
+# and MCP session IDs are exactly 32 hex characters, so they stay legible,
+# while sealed URLs (~136 chars) and JWTs are comfortably above it. A blanket
+# rule at 32 would redact the identifiers an operator most needs to follow.
+LONG_SECRET_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{64,}(?![A-Za-z0-9_-])")
+
+# JWTs need their own pattern: the dots between segments break them into runs
+# shorter than the floor above, so a `liauth` token would otherwise survive.
+# They always begin `eyJ` — base64url of `{"` — which makes this specific
+# enough not to catch anything else.
+JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
+
+# Validation errors echo the value that failed, and a caller can put anything
+# in an argument — an address, a password, a whole credential pair. Anything
+# email-shaped is therefore removed from text destined for a log.
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def scrub(text: str) -> str:
+    """Remove anything credential-shaped from text bound for a log.
+
+    Ordered widest-anchor first so a sealed URL is replaced as a unit rather
+    than being partly consumed by a later pattern.
+    """
+    scrubbed = TOKEN_REDACT_RE.sub(r"\1<redacted>", text)
+    scrubbed = JWT_RE.sub("<redacted-jwt>", scrubbed)
+    scrubbed = LONG_SECRET_RE.sub("<redacted>", scrubbed)
+    return EMAIL_RE.sub("<redacted-email>", scrubbed)
+
 DEFAULT_MOUNT_PATH = "/mcp"
 
 

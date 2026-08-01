@@ -7,6 +7,7 @@ both were producing wrong answers rather than errors.
 
 from __future__ import annotations
 
+import threading
 from typing import Any, ClassVar
 
 import pytest
@@ -49,9 +50,19 @@ class FakeUnsaved:
         )
 
 
-def _service() -> LoseItService:
+def _service(search_results: list | None = None) -> LoseItService:
+    """A service with its lifecycle fields set but no network behind it."""
     svc = LoseItService.__new__(LoseItService)
     svc._settings = None
+    svc._lock = threading.RLock()
+    svc._inflight = 0
+    svc._retired = []
+    svc._generation = 0
+    svc._session = None
+    # `client` is a property that would otherwise try to build a real one.
+    svc._client = type(
+        "FakeClient", (), {"search": staticmethod(lambda q: list(search_results or []))}
+    )()
     return svc
 
 
@@ -139,11 +150,12 @@ class TestFoodRef:
 
 class TestSearchEnrichment:
     def _svc(self, describe: Any) -> LoseItService:
-        svc = _service()
-        svc._call = lambda name, *a, **k: [  # type: ignore[method-assign]
+        hits = [
             {"name": "A", "brand": "", "category": "F", "food_id": "a" * 32},
             {"name": "B", "brand": "", "category": "F", "food_id": "b" * 32},
         ]
+        svc = _service(hits)
+        svc._reading = lambda fn: fn()  # type: ignore[method-assign]
         svc.describe_food = describe  # type: ignore[method-assign]
         return svc
 
@@ -197,8 +209,8 @@ class TestSearchEnrichment:
         assert len(calls) == 1, "enriched a food that was going to be discarded"
 
     def test_an_empty_search_enriches_nothing(self) -> None:
-        svc = _service()
-        svc._call = lambda name, *a, **k: []  # type: ignore[method-assign]
+        svc = _service([])
+        svc._reading = lambda fn: fn()  # type: ignore[method-assign]
         assert svc.search_food("nothing") == []
 
     def test_enrichment_is_capped_independently_of_limit(self) -> None:
@@ -207,11 +219,12 @@ class TestSearchEnrichment:
         limit roughly 25x against Lose It."""
         from loseit_mcp.service import _MAX_ENRICHED
 
-        svc = _service()
-        svc._call = lambda name, *a, **k: [  # type: ignore[method-assign]
+        many = [
             {"name": f"F{i}", "brand": "", "category": "F", "food_id": f"{i:032x}"}
             for i in range(50)
         ]
+        svc = _service(many)
+        svc._reading = lambda fn: fn()  # type: ignore[method-assign]
         calls: list[str] = []
 
         def counting(fid: str) -> dict[str, Any]:
@@ -456,6 +469,125 @@ class TestUnresolvableFood:
         means 'no such food'."""
         out = _describe_from_unsaved("a" * 32, FakeUnsaved(name="", nutrients={"calories": 5.0}))
         assert out["nutrients_per_serving"]["calories"] == 5.0
+
+
+class TestTransientUpstreamRetry:
+    """Lose It's search endpoint intermittently throws a bare RuntimeException.
+
+    Measured at roughly a third of calls in one sitting, on search
+    specifically, clearing on an immediate retry. Left unhandled it surfaces to
+    the user as a broken connector, which is what it looked like from a chat
+    client.
+    """
+
+    def _svc(self) -> Any:
+        from loseit_mcp.service import LoseItService
+
+        svc = LoseItService.__new__(LoseItService)
+        svc._settings = None
+        svc._lock = threading.RLock()
+        svc._client = None
+        svc._inflight = 0
+        svc._retired = []
+        svc._generation = 0
+        return svc
+
+    def test_a_transient_fault_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from lose_it.core._http import LoseItError
+
+        from loseit_mcp import service as S
+
+        monkeypatch.setattr(S.time, "sleep", lambda _s: None)
+        svc = self._svc()
+        attempts = {"n": 0}
+
+        def flaky() -> str:
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise LoseItError("GWT error: java.lang.RuntimeException/515124647")
+            return "ok"
+
+        assert svc._reading(flaky) == "ok"
+        assert attempts["n"] == 3
+
+    def test_it_gives_up_rather_than_looping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from lose_it.core._http import LoseItError
+
+        from loseit_mcp import service as S
+        from loseit_mcp.service import _TRANSIENT_ATTEMPTS
+
+        monkeypatch.setattr(S.time, "sleep", lambda _s: None)
+        svc = self._svc()
+        attempts = {"n": 0}
+
+        def always() -> str:
+            attempts["n"] += 1
+            raise LoseItError("GWT error: java.lang.RuntimeException/515124647")
+
+        with pytest.raises(LoseItError):
+            svc._reading(always)
+        assert attempts["n"] == _TRANSIENT_ATTEMPTS
+
+    def test_a_real_error_is_not_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Retrying a genuine failure just delays the message the user needs."""
+        from lose_it.core._http import LoseItError
+
+        from loseit_mcp import service as S
+
+        monkeypatch.setattr(S.time, "sleep", lambda _s: None)
+        svc = self._svc()
+        attempts = {"n": 0}
+
+        def missing() -> str:
+            attempts["n"] += 1
+            raise LoseItError("Food with id abc not found")
+
+        with pytest.raises(LoseItError):
+            svc._reading(missing)
+        assert attempts["n"] == 1
+
+    def test_an_auth_failure_is_not_treated_as_transient(self) -> None:
+        """It has its own path — re-login, not blind retry. Retrying it here
+        would burn all the attempts against a token that cannot work."""
+        from lose_it.core._http import LoseItAuthError, LoseItError
+
+        from loseit_mcp.service import _is_transient_upstream
+
+        assert not _is_transient_upstream(
+            LoseItError("GWT error: UserAuthenticationFailedException/1")
+        )
+        assert not _is_transient_upstream(LoseItAuthError("401"))
+        # ...but a genuine server fault still is.
+        assert _is_transient_upstream(
+            LoseItError("GWT error: java.lang.RuntimeException/515124647")
+        )
+
+    def test_search_goes_through_the_read_retry(self) -> None:
+        """The endpoint that actually flakes. Regression: search used the
+        plain call path, so a RuntimeException surfaced to the user as a
+        broken connector."""
+        hits = [{"name": "A", "brand": "", "category": "F", "food_id": "a" * 32}]
+        svc = _service(hits)
+        used = {"reading": 0}
+
+        def counting(fn: Any) -> Any:
+            used["reading"] += 1
+            return fn()
+
+        svc._reading = counting  # type: ignore[method-assign]
+        svc.search_food("x", detail=False)
+        assert used["reading"] == 1, "search bypassed the transient-retry path"
+
+    def test_writes_do_not_use_the_read_retry(self) -> None:
+        """A write that appears to fail may still have been applied, so a retry
+        risks logging the same food twice."""
+        import inspect
+
+        from loseit_mcp.service import LoseItService
+
+        for name in ("log_food", "log_custom_food", "delete_entry", "log_weight"):
+            src = inspect.getsource(getattr(LoseItService, name))
+            assert "_reading(" not in src, f"{name} retries a write"
 
 
 class TestInstructions:

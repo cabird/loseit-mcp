@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -87,6 +88,30 @@ def _is_auth_failure(exc: Exception) -> bool:
         message = str(exc)
         return any(marker in message for marker in _AUTH_FAILURE_MARKERS)
     return False
+
+
+# Lose It's search endpoint intermittently answers with a bare
+# ``java.lang.RuntimeException`` — measured at roughly a third of calls in one
+# sitting, on the search RPC specifically and not on food lookups. It carries
+# no detail and clears on an immediate retry, so it is a fault on their side
+# rather than anything about the request.
+_TRANSIENT_MARKERS = (
+    "java.lang.RuntimeException",
+    "java.lang.NullPointerException",
+    "IncompatibleRemoteServiceException",
+)
+
+# Deliberately small. These retries sit inside a single tool call, where no
+# rate limiter gets another say, so the ceiling has to live here.
+_TRANSIENT_ATTEMPTS = 4
+_TRANSIENT_BACKOFF = 0.3
+
+
+def _is_transient_upstream(exc: Exception) -> bool:
+    """True if ``exc`` is a Lose It hiccup that a retry is likely to clear."""
+    if not isinstance(exc, LoseItError) or _is_auth_failure(exc):
+        return False
+    return any(marker in str(exc) for marker in _TRANSIENT_MARKERS)
 
 
 # The widest weight-history range a single call may request. Lose It! launched
@@ -272,6 +297,27 @@ class LoseItService:
             with self._in_flight():
                 return fn()
 
+    def _reading(self, fn: Callable[[], _T]) -> _T:
+        """Run a *read*, retrying Lose It's intermittent server-side faults.
+
+        Only for reads. A write that appears to fail may still have been
+        applied, so retrying one risks logging the same food twice — far worse
+        than surfacing the error. Auth failures are handled by
+        :meth:`_retrying` underneath and are not counted here.
+        """
+        last: Exception | None = None
+        for attempt in range(_TRANSIENT_ATTEMPTS):
+            try:
+                return self._retrying(fn)
+            except Exception as exc:
+                if not _is_transient_upstream(exc):
+                    raise
+                last = exc
+                if attempt + 1 < _TRANSIENT_ATTEMPTS:
+                    time.sleep(_TRANSIENT_BACKOFF * (attempt + 1))
+        assert last is not None
+        raise last
+
     def _call(self, fn_name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke an SDK method, retrying once after a re-login on auth failure."""
         return self._retrying(lambda: getattr(self.client, fn_name)(*args, **kwargs))
@@ -337,7 +383,7 @@ class LoseItService:
         Enrichment is per-food best-effort: one unresolvable hit yields a
         result carrying just its name, never an exception for the whole search.
         """
-        results = self._call("search", query)
+        results = self._reading(lambda: self.client.search(query))
         hits = [_food_to_dict(r) for r in results[:limit]]
         if not detail or not hits:
             return hits
@@ -391,7 +437,7 @@ class LoseItService:
         in-flight — without that, a concurrent re-login closes the client
         underneath it.
         """
-        return self._retrying(
+        return self._reading(
             lambda: _describe_from_unsaved(
                 food_id, _get_unsaved(self.client.http, _food_ref(food_id))
             )

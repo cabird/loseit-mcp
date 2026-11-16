@@ -42,11 +42,23 @@ config file → defaults**.
 | `LOSEIT_EMAIL` | yes\* | Lose It! account email |
 | `LOSEIT_PASSWORD` | yes\* | Lose It! account password |
 | `LOSEIT_TOKEN` | no | A `liauth` JWT, used instead of email/password |
-| `LOSEIT_HOURS_FROM_GMT` | no | UTC offset in whole hours; auto-detected |
+| `LOSEIT_TIMEZONE` | no | IANA account zone, e.g. `America/Los_Angeles`; follows DST |
+| `LOSEIT_HOURS_FROM_GMT` | no | Fixed UTC offset in whole hours; alternative to a named zone |
 | `LOSEIT_STRONG_NAME` | no | GWT permutation, if Lose It ships a new build |
 | `LOSEIT_POLICY_HASH` | no | GWT policy hash, if Lose It ships a new build |
 
 \* Not required if `LOSEIT_TOKEN` is set.
+
+Use `--timezone America/Los_Angeles` (or `LOSEIT_TIMEZONE`) to keep relative
+dates correct across DST without twice-yearly offset changes. Use one zone or
+fixed offset per configuration layer; for example,
+`loseit-mcp --timezone America/Los_Angeles diary today`.
+A higher-priority layer replaces the
+lower-priority timezone choice. The JSON config key is `timezone_name`.
+Named zones require OS timezone data (or `tzdata`). The SDK only accepts whole
+hours, so fractional offsets are rejected rather than rounded, including on
+historical dates. See [per-user timezones](DEPLOYMENT.md#per-user-timezones) for
+HTTP headers, credential URL migration and rollback.
 
 `.env` is gitignored. The session token is cached at
 `~/.config/loseit-mcp/session.json` with owner-only permissions and refreshes

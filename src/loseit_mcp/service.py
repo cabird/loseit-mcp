@@ -34,6 +34,7 @@ from lose_it.core.daily import get_daydate_key
 from .auth import Session, resolve_session
 from .config import Settings
 from .observability import current_request_id
+from .timezones import offset_for, today_in_zone
 from .weight import get_weight_history as _get_weight_history
 from .weight import save_weight
 
@@ -164,7 +165,11 @@ def _unescape(text: str) -> str:
     return _GWT_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
 
 
-def _parse_date(value: str | date | None, hours_from_gmt: int | None = None) -> date | None:
+def _parse_date(
+    value: str | date | None,
+    hours_from_gmt: int | None = None,
+    timezone_name: str | None = None,
+) -> date | None:
     """Accept ``None``, a ``date``, ``'today'``/``'yesterday'``, or ISO ``YYYY-MM-DD``.
 
     Relative names resolve against the *account's* timezone rather than the
@@ -175,9 +180,9 @@ def _parse_date(value: str | date | None, hours_from_gmt: int | None = None) -> 
         return value
     text = value.strip().lower()
     if not text or text == "today":
-        return account_today(hours_from_gmt)
+        return account_today(hours_from_gmt, timezone_name)
     if text == "yesterday":
-        return account_today(hours_from_gmt) - timedelta(days=1)
+        return account_today(hours_from_gmt, timezone_name) - timedelta(days=1)
     try:
         # A calendar date carries no time or zone of its own; the account
         # offset is applied by the caller where it matters.
@@ -188,8 +193,10 @@ def _parse_date(value: str | date | None, hours_from_gmt: int | None = None) -> 
         ) from exc
 
 
-def account_today(hours_from_gmt: int | None) -> date:
+def account_today(hours_from_gmt: int | None, timezone_name: str | None = None) -> date:
     """Today's date in the account's timezone."""
+    if timezone_name is not None:
+        return today_in_zone(timezone_name)
     if hours_from_gmt is None:
         # No configured offset — the host's local date is the best guess.
         return date.today()  # noqa: DTZ011
@@ -235,15 +242,28 @@ class LoseItService:
     @property
     def client(self) -> LoseIt:
         with self._lock:
+            if (
+                getattr(self._settings, "timezone_name", None)
+                and self._client is not None
+                and self._client.http.config.hours_from_gmt != self._offset()
+            ):
+                self._retired.append(self._client)
+                self._client = None
             if self._client is None:
                 self._client = self._build_client(self.session)
             return self._client
 
-    def _build_client(self, session: Session) -> LoseIt:
+    def _offset(self, day: date | None = None) -> int | None:
+        zone = getattr(self._settings, "timezone_name", None)
+        return offset_for(zone, day) if zone else self._settings.hours_from_gmt
+
+    def _build_client(
+        self, session: Session, *, hours_from_gmt: int | None = None,
+    ) -> LoseIt:
         config = Config.model_construct(
             user_id=session.user_id,
             user_name=session.user_name,
-            hours_from_gmt=self._settings.hours_from_gmt,
+            hours_from_gmt=self._offset() if hours_from_gmt is None else hours_from_gmt,
             policy_hash=self._settings.policy_hash,
             strong_name=self._settings.strong_name,
             base_url=self._settings.base_url,
@@ -383,6 +403,25 @@ class LoseItService:
                 time.sleep(delay)
         raise last  # pragma: no cover - the loop always returns or raises
 
+    def _with_day(self, day: date, operation: Callable[[LoseIt], _T]) -> _T:
+        if not getattr(self._settings, "timezone_name", None):
+            return operation(self.client)
+        # A dated client is isolated: concurrent requests for winter/summer
+        # must never mutate one another's SDK config. Re-auth retries build
+        # a fresh client from the new session, and every attempt closes it.
+        client = self._build_client(self.session, hours_from_gmt=self._offset(day))
+        try:
+            return operation(client)
+        finally:
+            client.close()
+
+    def _call_dated(self, day: date, fn_name: str, *args: Any, **kwargs: Any) -> Any:
+        if not getattr(self._settings, "timezone_name", None):
+            return self._call(fn_name, *args, **kwargs)
+        return self._retrying(
+            lambda: self._with_day(day, lambda client: getattr(client, fn_name)(*args, **kwargs))
+        )
+
     def _call(self, fn_name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke an SDK method, retrying once after a re-login on auth failure."""
         return self._retrying(lambda: getattr(self.client, fn_name)(*args, **kwargs))
@@ -406,11 +445,17 @@ class LoseItService:
 
     def _parse(self, value: str | date | None) -> date | None:
         """Parse a date argument against the account's timezone."""
-        return _parse_date(value, self._settings.hours_from_gmt)
+        zone = getattr(self._settings, "timezone_name", None)
+        day = _parse_date(value, self._settings.hours_from_gmt, zone)
+        if day is not None and zone:
+            offset_for(zone, day)
+        return day
 
     def _day(self, value: str | date | None) -> date:
         """Resolve a date argument, defaulting to today in the account's zone."""
-        return self._parse(value) or account_today(self._settings.hours_from_gmt)
+        return self._parse(value) or account_today(
+            self._settings.hours_from_gmt, getattr(self._settings, "timezone_name", None)
+        )
 
     def __enter__(self) -> Self:
         return self
@@ -423,12 +468,15 @@ class LoseItService:
     def whoami(self) -> dict[str, Any]:
         """Identity of the authenticated account."""
         session = self.session
-        return {
+        identity = {
             "user_id": session.user_id,
             "user_name": session.user_name,
             "email": session.email,
-            "hours_from_gmt": self._settings.hours_from_gmt,
+            "hours_from_gmt": self._offset(),
         }
+        if getattr(self._settings, "timezone_name", None):
+            identity["timezone_name"] = self._settings.timezone_name
+        return identity
 
     def search_food(
         self,
@@ -547,7 +595,7 @@ class LoseItService:
     def get_diary(self, when: str | date | None = None) -> dict[str, Any]:
         """All food log entries for a day."""
         day = self._day(when)
-        entries = self._call("diary", day)
+        entries = self._call_dated(day, "diary", day)
         items = [_entry_to_dict(e) for e in entries]
         return {
             "date": day.isoformat(),
@@ -612,7 +660,7 @@ class LoseItService:
             note = None
             kwargs["servings"] = 1.0 if servings is None else servings
 
-        result = _to_dict(self._call("log_food", ref, **kwargs))
+        result = _to_dict(self._call_dated(kwargs["when"], "log_food", ref, **kwargs))
         # The SDK echoes back the reference it was handed, so without this the
         # confirmation for a *write* would not say what was written.
         food = result.get("food")
@@ -719,8 +767,8 @@ class LoseItService:
     ) -> None:
         """Send a synthetic ``updateFoodLogEntry``, re-authenticating if needed."""
 
-        def send() -> None:
-            http = self.client.http
+        def send(client: LoseIt) -> None:
+            http = client.http
             day_num = day_number_for(day)
             day_key = get_daydate_key(http, day_num) or ""
             unsaved = UnsavedFoodLogEntry(
@@ -736,7 +784,7 @@ class LoseItService:
             )
             _entries.log_food(http, unsaved, meal_ordinal, day_key, day_num, servings)
 
-        self._retrying(send)
+        self._retrying(lambda: self._with_day(day, send))
 
     def log_weight(
         self,
@@ -759,7 +807,9 @@ class LoseItService:
         if dry_run:
             return result
 
-        saved = self._retrying(lambda: save_weight(self.client.http, weight, day))
+        saved = self._retrying(
+            lambda: self._with_day(day, lambda client: save_weight(client.http, weight, day))
+        )
         result["weight"] = saved
         return result
 
@@ -799,9 +849,29 @@ class LoseItService:
                 "you need more, request it in several ranges."
             )
 
-        entries = self._retrying(
-            lambda: _get_weight_history(self.client.http, start_date, end_date)
-        )
+        if getattr(self._settings, "timezone_name", None):
+            # SDK range payloads use one offset for both boundaries. Split at
+            # offset changes, then let the existing bounded reader chunk each
+            # constant-offset window. Never mutate a shared client in place.
+            entries = []
+            first = start_date
+            while first <= end_date:
+                last = first
+                offset = self._offset(first)
+                while last < end_date and self._offset(last + timedelta(days=1)) == offset:
+                    last += timedelta(days=1)
+                entries.extend(
+                    self._retrying(
+                        lambda first=first, last=last: self._with_day(
+                            first, lambda client: _get_weight_history(client.http, first, last)
+                        )
+                    )
+                )
+                first = last + timedelta(days=1)
+        else:
+            entries = self._retrying(
+                lambda: _get_weight_history(self.client.http, start_date, end_date)
+            )
 
         weights = [e["weight"] for e in entries]
         summary: dict[str, Any] = {
@@ -829,7 +899,7 @@ class LoseItService:
         wire delete (an upstream SDK invariant).
         """
         day = self._day(when)
-        entries = self._call("diary", day)
+        entries = self._call_dated(day, "diary", day)
         match = next((e for e in entries if _entry_id(e) == entry_id), None)
         if match is None:
             available = [_entry_id(e) for e in entries]
@@ -837,7 +907,7 @@ class LoseItService:
                 f"No entry {entry_id!r} in the diary for {day.isoformat()}. "
                 f"Entries that day: {available}"
             )
-        result = self._call("delete_entry", match)
+        result = self._call_dated(day, "delete_entry", match)
         return _to_dict(result)
 
 

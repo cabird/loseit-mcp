@@ -24,6 +24,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from .timezones import offset_for
+
 CONFIG_DIR = Path.home() / ".config" / "loseit-mcp"
 DEFAULT_CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_SESSION_FILE = CONFIG_DIR / "session.json"
@@ -70,10 +72,26 @@ class Settings:
     # so tenants would otherwise persist their live JWTs to a shared file and
     # clobber each other.
     persist_session: bool = True
+    timezone_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.timezone_name is not None:
+            if self.hours_from_gmt is not None:
+                raise ConfigError("Supply a timezone name or hours_from_gmt, not both.")
+            try:
+                offset_for(self.timezone_name)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
 
     def with_overrides(self, **kwargs: Any) -> Settings:
         """Return a copy with non-``None`` keyword arguments applied."""
         clean = {k: v for k, v in kwargs.items() if v is not None}
+        if clean.get("timezone_name") is not None:
+            if clean.get("hours_from_gmt") is not None:
+                raise ConfigError("Supply a timezone name or hours_from_gmt, not both.")
+            clean["hours_from_gmt"] = None
+        elif clean.get("hours_from_gmt") is not None:
+            clean["timezone_name"] = None
         return replace(self, **clean) if clean else self
 
     @property
@@ -103,6 +121,7 @@ class Settings:
             "user_id": self.user_id,
             "user_name": self.user_name,
             "hours_from_gmt": self.hours_from_gmt,
+            "timezone_name": self.timezone_name,
             "strong_name": self.strong_name,
             "base_url": self.base_url,
             "session_file": str(self.session_file),
@@ -129,6 +148,7 @@ def _from_env() -> dict[str, Any]:
         "user_id": os.environ.get("LOSEIT_USER_ID"),
         "user_name": os.environ.get("LOSEIT_USER_NAME"),
         "hours_from_gmt": os.environ.get("LOSEIT_HOURS_FROM_GMT"),
+        "timezone_name": os.environ.get("LOSEIT_TIMEZONE"),
         "strong_name": os.environ.get("LOSEIT_STRONG_NAME"),
         "policy_hash": os.environ.get("LOSEIT_POLICY_HASH"),
         "base_url": os.environ.get("LOSEIT_BASE_URL"),
@@ -167,11 +187,21 @@ def load_settings(
 
     path = config_file or DEFAULT_CONFIG_FILE
     layered: dict[str, Any] = {}
-    layered.update(_coerce(_from_config_file(path)))
-    layered.update(_coerce(_from_env()))
-    layered.update(_coerce({k: v for k, v in overrides.items() if v is not None}))
+    for layer in (
+        _from_config_file(path),
+        _from_env(),
+        {k: v for k, v in overrides.items() if v is not None},
+    ):
+        clean = _coerce(layer)
+        if clean.get("timezone_name") is not None:
+            if clean.get("hours_from_gmt") is not None:
+                raise ConfigError("Supply a timezone name or hours_from_gmt, not both.")
+            layered.pop("hours_from_gmt", None)
+        elif clean.get("hours_from_gmt") is not None:
+            layered.pop("timezone_name", None)
+        layered.update(clean)
 
     settings = Settings(**layered)
-    if settings.hours_from_gmt is None:
+    if settings.hours_from_gmt is None and settings.timezone_name is None:
         settings = replace(settings, hours_from_gmt=_detect_hours_from_gmt())
     return settings

@@ -24,12 +24,14 @@ from .auth import AuthError, login
 from .config import Settings
 from .sealed import SealError, UrlSealer
 from .service import LoseItService
+from .timezones import offset_for
 from .tokencache import TokenCache
 from .webapp import current_path_token
 
 EMAIL_HEADER = "x-loseit-email"
 PASSWORD_HEADER = "x-loseit-password"
 TZ_OFFSET_HEADER = "x-loseit-hours-from-gmt"
+TZ_NAME_HEADER = "x-loseit-timezone"
 
 
 class CredentialsError(RuntimeError):
@@ -44,6 +46,16 @@ class Credentials:
     # this every user's "today" would be the container's, which can log food to
     # the wrong day near midnight.
     hours_from_gmt: int | None = None
+    timezone_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.timezone_name is not None:
+            if self.hours_from_gmt is not None:
+                raise CredentialsError("Supply a timezone header or offset header, not both.")
+            try:
+                offset_for(self.timezone_name)
+            except ValueError as exc:
+                raise CredentialsError(str(exc)) from exc
 
 
 def _decode_basic(value: str) -> Credentials | None:
@@ -145,6 +157,7 @@ class SessionResolver:
             user_id=session.user_id,
             user_name=session.user_name,
             hours_from_gmt=creds.hours_from_gmt,
+            timezone_name=creds.timezone_name,
             # The on-disk session cache is process-wide, so in multi-tenant
             # serving it would collect whichever tenant re-authenticated last.
             # TokenCache already provides this caching, per-credential.
@@ -180,6 +193,16 @@ def credentials_from_request(
     # Parsed first so a malformed offset is reported rather than swallowed by
     # the fallback to the sealed URL.
     offset = _offset_from_headers(headers)
+    zone = headers.get(TZ_NAME_HEADER) if hasattr(headers, "get") else None
+    if zone is not None:
+        # Validate before authentication, so malformed timezone input never
+        # falls through to a different credential source or triggers a login.
+        if offset is not None:
+            raise CredentialsError("Supply a timezone header or offset header, not both.")
+        try:
+            offset_for(zone)
+        except ValueError as exc:
+            raise CredentialsError(str(exc)) from exc
 
     try:
         creds = credentials_from_headers(headers)
@@ -194,11 +217,14 @@ def credentials_from_request(
         creds = Credentials(
             email=opened.email,
             password=opened.password,
-            hours_from_gmt=opened.hours_from_gmt,
+            hours_from_gmt=None if opened.timezone_name else opened.hours_from_gmt,
+            timezone_name=opened.timezone_name,
         )
 
-    if offset is not None:
-        creds = replace(creds, hours_from_gmt=offset)
+    if zone is not None:
+        creds = replace(creds, hours_from_gmt=None, timezone_name=zone)
+    elif offset is not None:
+        creds = replace(creds, hours_from_gmt=offset, timezone_name=None)
     return creds
 
 

@@ -29,6 +29,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from .timezones import offset_for
+
 # Bumped if the payload format ever changes, so old URLs fail cleanly rather
 # than being misparsed.
 _VERSION = b"\x01"
@@ -92,6 +94,7 @@ class SealedCredentials:
     password: str
     hours_from_gmt: int | None = None
     expires_at: float | None = None
+    timezone_name: str | None = None
 
 
 def _b64e(raw: bytes) -> str:
@@ -152,10 +155,20 @@ class UrlSealer:
         *,
         hours_from_gmt: int | None = None,
         ttl_days: int | None = DEFAULT_TTL_DAYS,
+        timezone_name: str | None = None,
     ) -> str:
         """Return the URL segment encoding these credentials."""
         if not email or not password:
             raise SealError("Both email and password are required.")
+
+        if timezone_name is not None:
+            if hours_from_gmt is not None:
+                raise SealError("Supply a timezone name or hours_from_gmt, not both.")
+            try:
+                # Old readers ignore tz_name and retain this numeric fallback.
+                hours_from_gmt = offset_for(timezone_name)
+            except ValueError as exc:
+                raise SealError(str(exc)) from exc
 
         payload = {
             "e": email,
@@ -163,6 +176,8 @@ class UrlSealer:
             "tz": hours_from_gmt,
             "x": None if ttl_days is None else time.time() + ttl_days * 86400,
         }
+        if timezone_name is not None:
+            payload["tz_name"] = timezone_name
         nonce = os.urandom(_NONCE_BYTES)
         ciphertext = AESGCM(self._key).encrypt(
             nonce, json.dumps(payload, separators=(",", ":")).encode("utf-8"), _VERSION
@@ -189,6 +204,9 @@ class UrlSealer:
             plaintext = AESGCM(self._key).decrypt(nonce, raw[1 + _NONCE_BYTES :], _VERSION)
             data = json.loads(plaintext)
             email, password = data["e"], data["p"]
+            zone = data.get("tz_name")
+            if zone is not None:
+                offset_for(zone)
             if not isinstance(email, str) or not isinstance(password, str):
                 raise TypeError("bad payload")
         except Exception as exc:
@@ -204,4 +222,5 @@ class UrlSealer:
             password=password,
             hours_from_gmt=tz if isinstance(tz, int) else None,
             expires_at=expires_at if isinstance(expires_at, int | float) else None,
+            timezone_name=zone,
         )

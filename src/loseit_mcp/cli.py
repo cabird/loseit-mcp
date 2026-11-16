@@ -42,10 +42,14 @@ def _add_credential_flags(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--token", help="A liauth JWT, used instead of email/password.")
     group.add_argument("--config", type=Path, help="Path to a JSON config file.")
     group.add_argument("--env-file", type=Path, help="Path to a .env file.")
-    group.add_argument(
+    tz_group = group.add_mutually_exclusive_group()
+    tz_group.add_argument(
         "--hours-from-gmt",
         type=int,
         help="UTC offset in whole hours (auto-detected by default).",
+    )
+    tz_group.add_argument(
+        "--timezone", dest="timezone_name", help="IANA account zone, e.g. America/Los_Angeles."
     )
 
 
@@ -57,6 +61,7 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         password=getattr(args, "password", None),
         token=getattr(args, "token", None),
         hours_from_gmt=getattr(args, "hours_from_gmt", None),
+        timezone_name=getattr(args, "timezone_name", None),
     )
 
 
@@ -185,11 +190,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Days before the URL stops working (server default: 365).",
     )
-    enroll.add_argument(
+    enroll_tz = enroll.add_mutually_exclusive_group()
+    enroll_tz.add_argument(
         "--tz",
         type=int,
         dest="tz_offset",
         help="Your UTC offset in whole hours, e.g. -7. Defaults to this machine's.",
+    )
+    enroll_tz.add_argument(
+        "--timezone", dest="timezone_name", default=argparse.SUPPRESS,
+        help="IANA account zone; follows DST automatically."
     )
     enroll.add_argument(
         "--insecure",
@@ -594,6 +604,7 @@ def _run_enroll(args: argparse.Namespace) -> int:
             email=args.email,
             ttl_days=args.ttl_days,
             tz_offset=args.tz_offset,
+            timezone_name=args.timezone_name,
             allow_insecure=args.insecure,
         )
     except EnrollClientError as exc:

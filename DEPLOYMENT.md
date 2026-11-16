@@ -554,22 +554,75 @@ With a credential URL (no headers needed):
 | `LOSEIT_ALLOWED_HOSTS` | `WEBSITE_HOSTNAME`, else localhost | Comma-separated hostnames the MCP endpoint will answer on |
 | `LOSEIT_PUBLIC_URL` | derived from `WEBSITE_HOSTNAME` | Where to send users whose URL expired; only affects that error message |
 | `PORT` | `8000` | Listen port |
-| `LOSEIT_HOURS_FROM_GMT` | auto-detected | Default account UTC offset |
+| `LOSEIT_TIMEZONE` | unset | IANA account zone, following DST; alternative to numeric offset |
+| `LOSEIT_HOURS_FROM_GMT` | auto-detected without a zone | Fixed default account UTC offset |
 | `LOSEIT_STRONG_NAME` | current build | GWT permutation, if Lose It redeploys |
 | `LOSEIT_POLICY_HASH` | current build | GWT policy hash, if Lose It redeploys |
 
 ## Per-user timezones
 
-Containers run in UTC, so relative dates (`today` / `yesterday`) would otherwise
-resolve against the container's clock rather than the caller's — logging food to
-the wrong day near midnight. Set `LOSEIT_HOURS_FROM_GMT` for a single-timezone
-deployment, seal `hours_from_gmt` into the URL at enrollment, or send:
+Containers usually run in UTC. Configure the account's zone so relative dates
+(`today` / `yesterday`) follow its local calendar, including DST. For one
+account, set `LOSEIT_TIMEZONE=America/Los_Angeles`, or pass
+`--timezone America/Los_Angeles`. The JSON config key is `timezone_name`.
 
-```
-X-LoseIt-Hours-From-GMT: -7
+For URL-only clients, enroll with a named zone once:
+
+```console
+loseit-mcp enroll https://<host> --timezone America/Los_Angeles
 ```
 
-The header wins over the sealed value, which wins over the environment default.
+The enrollment page has an optional account-timezone field. Its JSON API takes
+`"timezone": "America/Los_Angeles"`. Supply a name or `hours_from_gmt`, not both.
+The CLI requires the server to confirm the named zone; an older server cannot
+silently ignore that request and return a fixed-offset URL as though DST works.
+
+Header-capable clients can send:
+
+```text
+X-LoseIt-Timezone: America/Los_Angeles
+```
+
+The existing `--hours-from-gmt`, `LOSEIT_HOURS_FROM_GMT`, enrollment `--tz`,
+JSON `hours_from_gmt` and `X-LoseIt-Hours-From-GMT` remain supported. A fixed
+offset never changes for DST. Sending both timezone headers is rejected.
+Configuration layers similarly accept only one choice per layer; an explicit
+higher-priority zone/offset replaces the lower-priority choice.
+
+### Precedence and migration
+
+Request timezone headers override the sealed choice, which overrides the server
+default. This is a source-based choice: an old URL sealed with -8 still beats a
+new named server default. No existing URL is invalidated or silently migrated.
+To opt into automatic DST, enroll once with the named zone and replace the URL
+in each client. Do not rotate the server's URL secret for a timezone migration.
+
+Named-zone URLs keep the existing encryption format and include an extra
+`tz_name` field plus an enrollment-time numeric `tz` fallback. New readers use
+the name. If rolled back to an old server, authentication still works but the
+old reader uses that fixed numeric fallback: automatic DST is lost until the
+server is upgraded again. Keep the old offset/reminder procedure available
+for that rollback scenario.
+
+`whoami` and `server_status` report `timezone_name` when configured and the
+currently effective `hours_from_gmt`. The session cache stores authentication,
+not timezone configuration. A long-lived process refreshes its SDK offset as
+DST changes. Dated requests use local noon on their target date to choose the
+SDK's integer offset, with isolated clients so concurrent winter/summer reads
+cannot overwrite each other's config. Weight-history ranges split at offset
+changes while retaining the existing range size/bisection limits.
+
+### Supported offsets and timezone data
+
+Python's `zoneinfo` uses the runtime's timezone database. The current Linux
+Python slim base supplies it; on other systems install OS timezone data or the
+`tzdata` package if needed. Missing or unknown zone data is a clear error.
+
+Lose It's SDK serializes offsets as whole hours. Fractional offsets, such as
+Asia/Kolkata or Asia/Kathmandu, are rejected rather than rounded. Historical
+dates can also have fractional offsets even in a zone that uses whole hours
+today; those dated requests are rejected before sending an RPC. This change
+does not extend the private API's offset representation.
 
 ## When Lose It changes their API
 

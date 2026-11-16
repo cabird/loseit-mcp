@@ -151,6 +151,11 @@ PAGE = """<!doctype html>
       <details>
         <summary>Options</summary>
         <div class="field">
+          <label for="zone">Account timezone (optional)</label>
+          <input id="zone" name="timezone" type="text" maxlength="100"
+                 placeholder="America/Los_Angeles" autocomplete="off">
+          <p class="hint">An IANA name follows daylight saving time automatically.
+             Use either this or the fixed offset below, not both.</p>
           <label for="tz">UTC offset in hours</label>
           <input id="tz" name="hours_from_gmt" type="number" min="-12" max="14"
                  placeholder="detected automatically">
@@ -258,7 +263,13 @@ PAGE = """<!doctype html>
 
     var body = {{ email: email, password: password }};
     var tz = numeric('tz');
-    if (tz !== null) body.hours_from_gmt = tz;
+    var zone = document.getElementById('zone').value.trim();
+    if (zone && tz !== null) {{
+      showError('Use a timezone name or a fixed offset, not both.');
+      return;
+    }}
+    if (zone) body.timezone = zone;
+    else if (tz !== null) body.hours_from_gmt = tz;
 
     submit.disabled = true;
     submit.textContent = 'Checking your login\\u2026';

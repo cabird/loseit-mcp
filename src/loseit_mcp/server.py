@@ -449,6 +449,8 @@ def build_server(
                     "email": identity.get("email"),
                     "hours_from_gmt": identity.get("hours_from_gmt"),
                 }
+                if identity.get("timezone_name"):
+                    status["account"]["timezone_name"] = identity["timezone_name"]
                 try:
                     # detail=False: this is a reachability probe, and enriching
                     # would make a nutrition failure look like Lose It being

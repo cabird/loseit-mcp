@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .timezones import offset_for
+
 
 class EnrollClientError(RuntimeError):
     """Enrollment could not be completed."""
@@ -49,6 +51,7 @@ def enroll(
     email: str | None = None,
     ttl_days: int | None = None,
     tz_offset: int | None = None,
+    timezone_name: str | None = None,
     allow_insecure: bool = False,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
@@ -71,14 +74,27 @@ def enroll(
             "--insecure if this is a local test server."
         )
 
+    if timezone_name is not None:
+        if tz_offset is not None:
+            raise EnrollClientError("Supply --timezone or --tz, not both.")
+        try:
+            offset_for(timezone_name)
+        except ValueError as exc:
+            raise EnrollClientError(str(exc)) from exc
+
     email = email or os.environ.get("LOSEIT_EMAIL") or _prompt("Lose It! email", secret=False)
     password = os.environ.get("LOSEIT_PASSWORD") or _prompt("Lose It! password", secret=True)
 
     payload: dict[str, Any] = {
         "email": email,
         "password": password,
-        "hours_from_gmt": _detect_offset() if tz_offset is None else tz_offset,
+        "hours_from_gmt": (
+            _detect_offset() if tz_offset is None and timezone_name is None else tz_offset
+        ),
     }
+    if timezone_name is not None:
+        payload.pop("hours_from_gmt")
+        payload["timezone"] = timezone_name
     if ttl_days is not None:
         payload["ttl_days"] = ttl_days
 
@@ -115,6 +131,10 @@ def enroll(
         raise EnrollClientError("The server returned a response that wasn't JSON.") from exc
     if not isinstance(body, dict) or "url" not in body:
         raise EnrollClientError("The server's response did not contain a URL.")
+    if timezone_name is not None and body.get("timezone") != timezone_name:
+        raise EnrollClientError(
+            "The server did not confirm named timezone support. Upgrade it or use --tz."
+        )
     return body
 
 

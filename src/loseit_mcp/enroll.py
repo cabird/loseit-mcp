@@ -33,6 +33,7 @@ from .auth import InvalidCredentialsError, UpstreamUnavailableError, login
 from .enrollpage import CONTENT_SECURITY_POLICY
 from .sealed import DEFAULT_TTL_DAYS, SealError, UrlSealer
 from .throttle import Limit, Throttle
+from .timezones import offset_for
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,11 @@ def add_enrollment_route(
                 null_means_default=True,
             )
             hours_from_gmt = _optional_int(body, "hours_from_gmt", None, minimum=-12, maximum=14)
+            zone = body.get("timezone")
+            if zone is not None:
+                if hours_from_gmt is not None:
+                    raise ValueError("Supply timezone or hours_from_gmt, not both.")
+                offset_for(zone)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -214,7 +220,10 @@ def add_enrollment_route(
                 )
 
         try:
-            sealed = sealer.seal(email, password, hours_from_gmt=hours_from_gmt, ttl_days=ttl_days)
+            sealed = sealer.seal(
+                email, password, hours_from_gmt=hours_from_gmt,
+                ttl_days=ttl_days, timezone_name=zone,
+            )
         except SealError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -223,6 +232,7 @@ def add_enrollment_route(
                 "url": f"{_public_base_url(request)}/u/{sealed}{mount_path}",
                 "expires_in_days": ttl_days,
                 "verified": verify is not None,
+                **({"timezone": zone} if zone is not None else {}),
                 "note": (
                     "This URL is a credential. It cannot be revoked individually "
                     "— rotate LOSEIT_URL_SECRET to invalidate all issued URLs."
